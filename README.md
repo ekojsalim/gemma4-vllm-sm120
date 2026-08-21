@@ -1,37 +1,48 @@
-# Gemma 4 / RTX 5090 vLLM runtime overlay
+# Gemma 4 / RTX 5090 vLLM overlays
 
-This repository packages the reviewed Python runtime changes used for a Gemma
-4 ModelOpt NVFP4 target with the Gemma 4 MTP assistant on one RTX 5090. It is a
-small overlay for the official vLLM image, not a custom container image.
+This repository carries small, version-pinned runtime overlays for the Gemma 4
+ModelOpt NVFP4 target and Gemma 4 MTP assistant on RTX 5090/SM120. It does not
+publish a custom container image.
 
-The deployment base is pinned to:
+Every supported vLLM base has its own immutable compatibility bundle under
+`versions/`. Full-file overlays are never reused across vLLM versions. A bundle
+contains its exact base-image contract, review patches, runtime snapshot, and
+focused tests.
 
-```text
-docker.io/vllm/vllm-openai@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
-```
+## Support matrix
 
-The image reports vLLM `0.26.0` and build revision
-`ffd46bfab2128bb84146050e98b51a617c6575ab`. The review patch base is
-`568afb3a13806beb53bb2e6bd518269357b237c0`.
+| vLLM | Status | Runtime image |
+| --- | --- | --- |
+| 0.26.0 | Production control | `sha256:ffb2d59b...abf52` |
+| 0.27.0 | Audit only; not deployable | `sha256:07ea4e2...52ed7` |
 
-## Deployment contract
+The deployed Vast startup remains pinned to release `v0.1.0`. Repository
+cleanup does not mutate that tag, release asset, or startup gist. The cleaned
+`v0.2.0` packaging candidate contains the same validated v0.26 runtime bytes and
+will require a separate release before deployment.
 
-The release asset contains only the overlay, compatibility manifests, license,
-and installer. A node startup script downloads the immutable asset, verifies
-its SHA-256, and runs:
+## Layout
+
+- `versions/vllm-0.26.0/`: complete validated compatibility bundle;
+- `compatibility/`: assessments for newer upstream releases;
+- `scripts/`: version-agnostic verification, build, install, and audit tools;
+- `docs/upgrading.md`: the required port and validation sequence; and
+- `Makefile`: short local entry points.
+
+## Verify and build
 
 ```bash
-bash scripts/install-overlay.sh
+make verify
+make release
 ```
 
-The installer verifies vLLM `0.26.0`, every source byte in the asset, and every
-base file it will replace. It accepts an already-installed byte-identical
-overlay, but fails closed on any other base. Installation finishes before any
-vLLM process is started.
+The release builder packages only the selected runtime overlay, manifests,
+installer, license, and attribution. It does not package tests, mail patches,
+weights, prompts, corpus data, node secrets, or FlashInfer tactic profiles.
 
-FlashInfer NVFP4 tactic profiles are deliberately absent. Each SM120 node tunes
-the complete bounded target domain once before readiness and reuses its frozen,
-node-local profile on later starts.
+The installer validates the installed vLLM version and every base file it will
+replace before the first `import vllm`. A mismatched image or partially patched
+runtime fails closed.
 
 ## Production shape
 
@@ -39,28 +50,14 @@ node-local profile on later starts.
 - BF16 Gemma 4 assistant;
 - ModelOpt NVFP4 target and FP8 KV cache;
 - Triton SWA/full attention;
-- CUDA graph captures through effective M=64;
-- `9,506,652,160` KV-cache bytes under the measured OCR memory pressure;
+- CUDA graph coverage through effective M=64;
+- node-local tune-once/freeze FlashInfer NVFP4 profiles;
+- `9,506,652,160` KV-cache bytes under measured OCR pressure;
 - `max_model_len=6144`, `max_num_seqs=32`, and
-  `max_num_batched_tokens=1024`;
-- prefix caching disabled and async scheduling enabled; and
-- ordinary hybrid-KV admission plus the separate speculative overlay.
+  `max_num_batched_tokens=1024`; and
+- separate ordinary hybrid-KV and speculative admission contracts.
 
-The measured local configuration retained 14.03 simultaneous full-length
-equivalent slots with OCR resident and safely served the representative
-mixed-length corpus at concurrency 32. A new node must revalidate physical
-capacity because its driver and OCR runtime may reserve different memory.
-
-## Repository contents
-
-- `overlay/`: exact runtime files installed into the official image;
-- `patches/`: nine-part review stack;
-- `tests/`: focused source-level regression tests;
-- `manifests/`: base compatibility and overlay integrity contracts;
-- `scripts/install-overlay.sh`: fail-closed runtime installer;
-- `scripts/build-release.sh`: deterministic release-asset builder; and
-- `docs/`: provenance and deployment notes.
-
-No checkpoint, Hugging Face cache, prompts, corpus data, generated tactic map,
-or node secret is published here.
+The v0.26 control demonstrated 14.03 simultaneous full-length-equivalent slots
+with OCR resident. A newer vLLM base must reproduce correctness, performance,
+graph behavior, allocation stability, and physical capacity before promotion.
 

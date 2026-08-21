@@ -1,23 +1,25 @@
 # Startup-script deployment
 
-Use the official image by immutable digest. Before launching vLLM, the node
-startup script must:
+The active Vast deployment remains pinned to the immutable `v0.1.0` release
+asset and its published SHA-256. Repository main is not a deployment channel.
 
-1. download one versioned release asset;
-2. verify the asset SHA-256;
-3. extract it into a fresh temporary directory;
-4. run `scripts/install-overlay.sh` before the first `import vllm`;
-5. persist Hugging Face, vLLM compile, and FlashInfer profile caches on the
-   node-local workspace;
-6. make OCR resident and healthy before allocating the exact vLLM KV pool; and
-7. wait for both API readiness and the frozen FlashInfer profile log record.
+For any release, the node startup script must:
 
-The profile directory is disposable node-local state. Do not copy profiles
-between nodes. A cold node may take several additional minutes for framework
-compilation; the measured FlashInfer target-domain tuning itself took about ten
-seconds. Runtime missing shapes and tuner mutation fail closed.
+1. use the exact official image digest recorded by the compatibility bundle;
+2. download one immutable overlay release asset;
+3. verify the complete asset SHA-256;
+4. extract into a fresh temporary directory;
+5. run `scripts/install-overlay.sh` before the first `import vllm`;
+6. persist Hugging Face, compile, and FlashInfer profile caches locally;
+7. make OCR resident before allocating the exact vLLM KV pool; and
+8. require API readiness plus a complete frozen FlashInfer profile record.
 
-The startup script must receive target and OCR checkpoint revisions as immutable
-commit hashes. Authentication tokens stay in process environment and must not
-be copied into `/etc/profile.d`, logs, release assets, or this repository.
+The profile directory is disposable node-local state and must not be copied
+between nodes. Target, assistant, and OCR inputs use immutable checkpoint
+revisions. Authentication tokens stay in process environment and must never be
+written to profile scripts, release assets, logs, or this repository.
+
+Promoting a new compatibility bundle requires a new release tag, asset checksum,
+and immutable gist revision. Existing tags and gist revisions are controls and
+are never rewritten.
 

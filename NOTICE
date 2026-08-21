@@ -6,5 +6,4 @@ the vLLM project and its contributors and distributed under the Apache License,
 Version 2.0. The upstream project is https://github.com/vllm-project/vllm.
 
 The modifications and their provenance are described in MODIFICATIONS.md and
-the reviewable patch series under patches/.
-
+the reviewable patch series under each versions/vllm-X.Y.Z/patches/ directory.
