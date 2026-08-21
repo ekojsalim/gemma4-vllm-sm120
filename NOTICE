@@ -1,0 +1,10 @@
+Gemma 4 SM120 vLLM runtime overlay
+Copyright 2026 Eko Julianto Salim
+
+This distribution contains modified portions of vLLM, originally developed by
+the vLLM project and its contributors and distributed under the Apache License,
+Version 2.0. The upstream project is https://github.com/vllm-project/vllm.
+
+The modifications and their provenance are described in MODIFICATIONS.md and
+the reviewable patch series under patches/.
+

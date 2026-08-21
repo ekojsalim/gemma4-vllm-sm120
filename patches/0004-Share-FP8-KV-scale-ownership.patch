@@ -1,0 +1,514 @@
+diff --git a/tests/v1/worker/test_utils.py b/tests/v1/worker/test_utils.py
+index 016b8aa5a..17ee7b2f7 100644
+--- a/tests/v1/worker/test_utils.py
++++ b/tests/v1/worker/test_utils.py
+@@ -1,19 +1,43 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import pytest
+ import torch
+ 
++from vllm.v1.attention.backend import (
++    resolve_kv_scale_owner,
++    sync_kv_scale_consumers,
++)
++from vllm.v1.worker import utils as worker_utils
+ from vllm.v1.worker.utils import bind_kv_cache
+ 
+ 
+-def test_bind_kv_cache(default_vllm_config):
+-    from vllm.model_executor.layers.attention import Attention
++class _AttentionStub(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.register_buffer("_q_scale", torch.ones(1))
++        self.register_buffer("_k_scale", torch.ones(1))
++        self.register_buffer("_v_scale", torch.ones(1))
++        self.register_buffer("_k_scale_cpu", torch.ones(1))
++        self.register_buffer("_v_scale_cpu", torch.ones(1))
++        self._k_scale_float = 1.0
++        self._v_scale_float = 1.0
++        self.kv_cache_dtype = "auto"
++        self.kv_sharing_target_layer_name = None
++        self.calculate_kv_scales = False
+ 
++
++@pytest.fixture(autouse=True)
++def _cpu_platform(monkeypatch):
++    monkeypatch.setattr(worker_utils.current_platform, "is_cpu", lambda: True)
++
++
++def test_bind_kv_cache():
+     ctx = {
+-        "layers.0.self_attn": Attention(32, 128, 0.1, prefix="layers.0.self_attn"),
+-        "layers.1.self_attn": Attention(32, 128, 0.1, prefix="layers.1.self_attn"),
+-        "layers.2.self_attn": Attention(32, 128, 0.1, prefix="layers.2.self_attn"),
+-        "layers.3.self_attn": Attention(32, 128, 0.1, prefix="layers.3.self_attn"),
++        "layers.0.self_attn": _AttentionStub(),
++        "layers.1.self_attn": _AttentionStub(),
++        "layers.2.self_attn": _AttentionStub(),
++        "layers.3.self_attn": _AttentionStub(),
+     }
+     kv_cache = {
+         "layers.0.self_attn": torch.zeros((1,)),
+@@ -34,13 +58,11 @@ def test_bind_kv_cache(default_vllm_config):
+     assert runner_kv_caches[3] is kv_cache["layers.3.self_attn"]
+ 
+ 
+-def test_bind_kv_cache_non_attention(default_vllm_config):
+-    from vllm.model_executor.layers.attention import Attention
+-
++def test_bind_kv_cache_non_attention():
+     # example from Jamba PP=2
+     ctx = {
+-        "model.layers.20.attn": Attention(32, 128, 0.1, prefix="model.layers.20.attn"),
+-        "model.layers.28.attn": Attention(32, 128, 0.1, prefix="model.layers.28.attn"),
++        "model.layers.20.attn": _AttentionStub(),
++        "model.layers.28.attn": _AttentionStub(),
+     }
+     kv_cache = {
+         "model.layers.20.attn": torch.zeros((1,)),
+@@ -57,19 +79,14 @@ def test_bind_kv_cache_non_attention(default_vllm_config):
+     assert runner_kv_caches[1] is kv_cache["model.layers.28.attn"]
+ 
+ 
+-def test_bind_kv_cache_draft_model(default_vllm_config):
+-    from vllm.model_executor.layers.attention import Attention
+-
++def test_bind_kv_cache_draft_model():
+     layer_names = [
+         "model.layers.0.attn",
+         "model.layers.1.attn",
+         "draft_model.layers.0.attn",
+         "draft_model.layers.1.attn",
+     ]
+-    ctx = {
+-        layer_name: Attention(32, 128, 0.1, prefix=layer_name)
+-        for layer_name in layer_names
+-    }
++    ctx = {layer_name: _AttentionStub() for layer_name in layer_names}
+     kv_cache = {layer_name: torch.zeros((1,)) for layer_name in layer_names}
+     runner_kv_caches: list[torch.Tensor] = []
+     bind_kv_cache(kv_cache, ctx, runner_kv_caches)
+@@ -90,3 +107,129 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
+     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
+     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
+     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
++
++
++def _configure_fp8_scale_owner(owner, consumer, owner_name):
++    owner.kv_cache_dtype = "fp8"
++    consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    owner._k_scale.fill_(0.125)
++    owner._v_scale.fill_(0.375)
++    owner._k_scale_float = 0.125
++    owner._v_scale_float = 0.375
++    owner._k_scale_cpu.fill_(0.125)
++    owner._v_scale_cpu.fill_(0.375)
++
++
++@pytest.mark.parametrize("attention_kind", ["sliding", "full"])
++def test_bind_shared_fp8_kv_scale_owner(attention_kind):
++    from vllm.v1.attention.backends import flashinfer, triton_attn
++
++    owner_name = f"model.layers.58.{attention_kind}_attn"
++    consumer_name = f"draft_model.layers.0.{attention_kind}_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    _configure_fp8_scale_owner(owner, consumer, owner_name)
++    consumer._q_scale.fill_(0.75)
++    cache = torch.arange(16, dtype=torch.uint8)
++    cache_before = cache.clone()
++    kv_cache = {owner_name: cache, consumer_name: cache}
++
++    bind_kv_cache(kv_cache, {owner_name: owner, consumer_name: consumer}, [])
++
++    assert resolve_kv_scale_owner(consumer) is owner
++    assert triton_attn.resolve_kv_scale_owner(consumer) is owner
++    assert flashinfer.resolve_kv_scale_owner(consumer) is owner
++    assert consumer._k_scale.item() == pytest.approx(0.125)
++    assert consumer._v_scale.item() == pytest.approx(0.375)
++    assert consumer._k_scale_float == pytest.approx(0.125)
++    assert consumer._v_scale_float == pytest.approx(0.375)
++    assert consumer._k_scale_cpu.item() == pytest.approx(0.125)
++    assert consumer._v_scale_cpu.item() == pytest.approx(0.375)
++    assert consumer._q_scale.item() == pytest.approx(0.75)
++    assert torch.equal(cache, cache_before)
++
++
++def test_bind_shared_bf16_kv_has_no_scale_owner():
++    owner_name = "model.layers.59.self_attn"
++    consumer_name = "draft_model.layers.3.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = "auto"
++    consumer.kv_cache_dtype = "auto"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.bfloat16)
++
++    bind_kv_cache(
++        {owner_name: cache, consumer_name: cache},
++        {owner_name: owner, consumer_name: consumer},
++        [],
++    )
++
++    assert resolve_kv_scale_owner(consumer) is consumer
++    assert consumer._k_scale.item() == 1.0
++    assert consumer._v_scale.item() == 1.0
++
++
++def test_shared_fp8_kv_scale_owner_refreshes_after_loading():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.uint8)
++    bind_kv_cache(
++        {owner_name: cache, consumer_name: cache},
++        {owner_name: owner, consumer_name: consumer},
++        [],
++    )
++
++    owner._k_scale.fill_(0.0625)
++    owner._v_scale.fill_(0.5)
++    owner._k_scale_float = 0.0625
++    owner._v_scale_float = 0.5
++    owner._k_scale_cpu.fill_(0.0625)
++    owner._v_scale_cpu.fill_(0.5)
++    sync_kv_scale_consumers(owner)
++
++    assert consumer._k_scale.item() == pytest.approx(0.0625)
++    assert consumer._v_scale.item() == pytest.approx(0.5)
++    assert consumer._k_scale_float == pytest.approx(0.0625)
++    assert consumer._v_scale_float == pytest.approx(0.5)
++
++
++def test_bind_shared_kv_rejects_incompatible_quantization():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = "fp8"
++    consumer.kv_cache_dtype = "auto"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="quantization mismatch"):
++        bind_kv_cache(
++            {owner_name: cache, consumer_name: cache},
++            {owner_name: owner, consumer_name: consumer},
++            [],
++        )
++
++
++def test_bind_shared_fp8_kv_rejects_scale_granularity():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    owner._buffers["_k_scale"] = torch.ones(16, dtype=torch.float32)
++    cache = torch.zeros(16, dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="scale shape mismatch"):
++        bind_kv_cache(
++            {owner_name: cache, consumer_name: cache},
++            {owner_name: owner, consumer_name: consumer},
++            [],
++        )
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 53882f30c..561ef041f 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -36,6 +36,9 @@ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionMetadata,
+     AttentionType,
++    resolve_kv_scale_owner,
++    sync_kv_scale_consumer,
++    sync_kv_scale_consumers,
+ )
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.selector import get_attn_backend
+@@ -597,6 +600,7 @@ class Attention(nn.Module, AttentionLayerBase):
+         self._v_scale_float = self._v_scale.item()
+         self._k_scale_cpu.fill_(self._k_scale_float)
+         self._v_scale_cpu.fill_(self._v_scale_float)
++        sync_kv_scale_consumers(self)
+         # We only calculate the scales once
+         self.calculate_kv_scales = False
+ 
+@@ -621,6 +625,11 @@ class Attention(nn.Module, AttentionLayerBase):
+         )
+         if not should_load_quant_weights(quant_method):
+             set_default_quant_scales(self, register_buffer=False)
++        owner = resolve_kv_scale_owner(self)
++        if owner is self:
++            sync_kv_scale_consumers(self)
++        else:
++            sync_kv_scale_consumer(self, owner)
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.attn_backend
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 6f23cff0b..edb402847 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -764,6 +764,52 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+         return False
+ 
+ 
++def resolve_kv_scale_owner(layer: torch.nn.Module) -> torch.nn.Module:
++    """Return the attention layer that owns a shared KV cache's K/V scales."""
++    owner_ref = getattr(layer, "_kv_scale_owner_ref", None)
++    if owner_ref is None:
++        return layer
++    owner = owner_ref()
++    if owner is None:
++        raise RuntimeError("shared KV-cache scale owner was released")
++    return owner
++
++
++def sync_kv_scale_consumer(
++    consumer: torch.nn.Module, owner: torch.nn.Module
++) -> None:
++    """Synchronize compatibility copies for backends reading consumer fields.
++
++    Triton and FlashInfer resolve the owner directly. Copies keep existing
++    backends correct for static scales and cover host/device cached fields.
++    """
++    for name in ("_k_scale", "_v_scale", "_k_scale_cpu", "_v_scale_cpu"):
++        destination = getattr(consumer, name)
++        source = getattr(owner, name)
++        if destination.shape != source.shape:
++            raise ValueError(
++                f"shared KV-cache scale shape mismatch for {name}: "
++                f"consumer={tuple(destination.shape)}, owner={tuple(source.shape)}"
++            )
++        destination.copy_(source)
++    consumer._k_scale_float = owner._k_scale_float
++    consumer._v_scale_float = owner._v_scale_float
++    consumer.calculate_kv_scales = False
++
++
++def sync_kv_scale_consumers(owner: torch.nn.Module) -> None:
++    """Refresh all live consumers after owner scales load or are calculated."""
++    consumer_refs = getattr(owner, "_kv_scale_consumer_refs", ())
++    live_refs = []
++    for consumer_ref in consumer_refs:
++        consumer = consumer_ref()
++        if consumer is not None:
++            sync_kv_scale_consumer(consumer, owner)
++            live_refs.append(consumer_ref)
++    if consumer_refs:
++        object.__setattr__(owner, "_kv_scale_consumer_refs", live_refs)
++
++
+ class AttentionLayer(Protocol):
+     _q_scale: torch.Tensor
+     _k_scale: torch.Tensor
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 5a0297472..1b0f0043a 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -61,6 +61,7 @@ from vllm.v1.attention.backend import (
+     AttentionType,
+     CommonAttentionMetadata,
+     MultipleOf,
++    resolve_kv_scale_owner,
+ )
+ from vllm.v1.attention.backends.utils import (
+     KVCacheLayoutType,
+@@ -309,8 +310,8 @@ class BatchDCPPrefillWrapper:
+         output_context_tmp, lse_context_tmp = self._context.run(
+             prefill_query_across_dcp,
+             kv_cache_tuple,
+-            k_scale=layer._k_scale_float,
+-            v_scale=layer._v_scale_float,
++            k_scale=resolve_kv_scale_owner(layer)._k_scale_float,
++            v_scale=resolve_kv_scale_owner(layer)._v_scale_float,
+             return_lse=True,
+         )
+         output_context, lse_context = self._dcp_combine(
+@@ -1650,7 +1651,7 @@ class FlashInferImpl(AttentionImpl):
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                 bmm1_scale *= layer._q_scale_float
+-            bmm1_scale *= layer._k_scale_float
++            bmm1_scale *= resolve_kv_scale_owner(layer)._k_scale_float
+         return bmm1_scale
+ 
+     # SM90 may need FP8-Q for native prefill and BF16/FP16-Q for XQA decode,
+@@ -1705,15 +1706,19 @@ class FlashInferImpl(AttentionImpl):
+             # Profiling run.
+             return output.fill_(0)
+ 
++        kv_scale_owner = resolve_kv_scale_owner(layer)
++
+         if self.bmm1_scale is None:
+             self.bmm1_scale = self.scale
+             if is_quantized_kv_cache(self.kv_cache_dtype):
+-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
++                self.bmm1_scale *= (
++                    layer._q_scale_float * kv_scale_owner._k_scale_float
++                )
+ 
+         if self.bmm2_scale is None:
+             self.bmm2_scale = 1.0
+             if is_quantized_kv_cache(self.kv_cache_dtype):
+-                self.bmm2_scale *= layer._v_scale_float
++                self.bmm2_scale *= kv_scale_owner._v_scale_float
+ 
+         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
+         decode_kernel = (
+@@ -1926,8 +1931,8 @@ class FlashInferImpl(AttentionImpl):
+                         prefill_query,
+                         kv_cache_for_fi,
+                         q_scale=layer._q_scale_float,
+-                        k_scale=layer._k_scale_float,
+-                        v_scale=layer._v_scale_float,
++                        k_scale=kv_scale_owner._k_scale_float,
++                        v_scale=kv_scale_owner._v_scale_float,
+                         out=out_prefill,
+                         kv_cache_sf=kv_cache_sf,
+                     )
+@@ -2012,8 +2017,8 @@ class FlashInferImpl(AttentionImpl):
+                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
+                         kv_cache_5d,
+                         block_tables_prefill,
+-                        layer._k_scale,
+-                        layer._v_scale,
++                        kv_scale_owner._k_scale,
++                        kv_scale_owner._v_scale,
+                         attn_metadata.q_data_type_prefill,
+                     )
+                 else:
+@@ -2092,8 +2097,8 @@ class FlashInferImpl(AttentionImpl):
+                         decode_query,
+                         kv_cache_for_fi,
+                         q_scale=layer._q_scale_float,
+-                        k_scale=layer._k_scale_float,
+-                        v_scale=layer._v_scale_float,
++                        k_scale=kv_scale_owner._k_scale_float,
++                        v_scale=kv_scale_owner._v_scale_float,
+                         out=output_tmp,
+                         lse=lse,
+                         return_lse=True,
+@@ -2109,8 +2114,8 @@ class FlashInferImpl(AttentionImpl):
+                         decode_query,
+                         kv_cache_for_fi,
+                         q_scale=layer._q_scale_float,
+-                        k_scale=layer._k_scale_float,
+-                        v_scale=layer._v_scale_float,
++                        k_scale=kv_scale_owner._k_scale_float,
++                        v_scale=kv_scale_owner._v_scale_float,
+                         out=out_decode,
+                         kv_cache_sf=kv_cache_sf,
+                     )
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index f8f2c89b2..0da92bfc6 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
+     AttentionType,
+     CommonAttentionMetadata,
+     MultipleOf,
++    resolve_kv_scale_owner,
+ )
+ from vllm.v1.attention.backends.utils import (
+     compute_mm_prefix_range_tensor,
+@@ -673,8 +674,9 @@ class TritonAttentionImpl(AttentionImpl):
+                 )
+                 else None
+             )
+-            k_descale = layer._k_scale.expand(descale_shape)
+-            v_descale = layer._v_scale.expand(descale_shape)
++            kv_scale_owner = resolve_kv_scale_owner(layer)
++            k_descale = kv_scale_owner._k_scale.expand(descale_shape)
++            v_descale = kv_scale_owner._v_scale.expand(descale_shape)
+             k_scale_cache = None
+             v_scale_cache = None
+ 
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 9e60d2ae7..c73ea823b 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import weakref
+ from collections import defaultdict
+ from collections.abc import Iterable, Sequence
+ from dataclasses import dataclass, field
+@@ -24,6 +25,7 @@ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionMetadataBuilder,
+     MultipleOf,
++    sync_kv_scale_consumer,
+ )
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import (
+@@ -32,9 +34,11 @@ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     KVCacheConfig,
+     KVCacheGroupSpec,
++    KVQuantMode,
+     KVCacheSpec,
+     MambaSpec,
+     UniformTypeKVCacheSpecs,
++    get_kv_quant_mode,
+ )
+ 
+ logger = init_logger(__name__)
+@@ -537,6 +541,45 @@ def bind_kv_cache(
+     for layer_name, kv_cache in kv_caches.items():
+         forward_context[layer_name].kv_cache = kv_cache
+ 
++    # KV sharing owns more than storage: quantized cache consumers must use
++    # the cache owner's calibrated K/V dequantization state. Q scales remain
++    # local to the layer performing the launch.
++    for layer_name, consumer in forward_context.items():
++        target_layer_name = getattr(
++            consumer, "kv_sharing_target_layer_name", None
++        )
++        if target_layer_name is None:
++            continue
++        owner = forward_context.get(target_layer_name)
++        if owner is None:
++            raise ValueError(
++                f"shared KV-cache owner {target_layer_name!r} for "
++                f"{layer_name!r} is not present during cache binding"
++            )
++        if consumer.kv_cache is not owner.kv_cache:
++            raise ValueError(
++                f"shared KV-cache consumer {layer_name!r} does not alias "
++                f"owner {target_layer_name!r}"
++            )
++        consumer_mode = get_kv_quant_mode(consumer.kv_cache_dtype)
++        owner_mode = get_kv_quant_mode(owner.kv_cache_dtype)
++        if consumer_mode != owner_mode:
++            raise ValueError(
++                f"shared KV-cache quantization mismatch for {layer_name!r}: "
++                f"consumer={consumer_mode}, owner={owner_mode}"
++            )
++        if consumer_mode != KVQuantMode.FP8_PER_TENSOR:
++            continue
++        object.__setattr__(consumer, "_kv_scale_owner_ref", weakref.ref(owner))
++        consumer_refs = [
++            consumer_ref
++            for consumer_ref in getattr(owner, "_kv_scale_consumer_refs", ())
++            if consumer_ref() is not None and consumer_ref() is not consumer
++        ]
++        consumer_refs.append(weakref.ref(consumer))
++        object.__setattr__(owner, "_kv_scale_consumer_refs", consumer_refs)
++        sync_kv_scale_consumer(consumer, owner)
++
+ 
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor | list[torch.Tensor]],

@@ -1,0 +1,776 @@
+diff --git a/tests/v1/core/test_kv_admission.py b/tests/v1/core/test_kv_admission.py
+index 0db018eb3..d2dec020f 100644
+--- a/tests/v1/core/test_kv_admission.py
++++ b/tests/v1/core/test_kv_admission.py
+@@ -7,6 +7,11 @@ from vllm.v1.core.kv_admission import (
+     HybridKVAdmissionLedger,
+     get_request_admission_length,
+     validate_hybrid_kv_admission,
++)
++from vllm.v1.core.speculative_admission import (
++    SpeculativeAdmissionOverlay,
++    select_graph_aware_speculative_depth,
++    speculative_depth_fallbacks,
+     validate_hybrid_mtp_admission,
+ )
+ 
+@@ -102,6 +107,63 @@ def test_two_in_flight_batches_charge_union_physical_peak_once():
+     assert ledger.stranded_blocks == 3
+ 
+ 
++def test_two_in_flight_batches_record_independent_depth_contracts():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    first = overlay.try_reserve(
++        batch_id=1,
++        request_id="r1",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=12,
++        selected_k=4,
++        lookahead_tokens=4,
++        completion_epoch=1,
++    )
++    second = overlay.try_reserve(
++        batch_id=2,
++        request_id="r2",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=12,
++        selected_k=2,
++        lookahead_tokens=2,
++        completion_epoch=2,
++    )
++    assert first is not None and second is not None
++    assert overlay.batch_contract(1).selected_k == 4
++    assert overlay.batch_contract(2).selected_k == 2
++    assert overlay.batch_contract(1).request_ids == ("r1",)
++    assert overlay.batch_contract(2).completion_epoch == 2
++
++
++def test_one_batch_rejects_mixed_depth_or_epoch():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    first = overlay.try_reserve(
++        batch_id=1,
++        request_id="r1",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=10,
++        selected_k=3,
++        lookahead_tokens=3,
++        completion_epoch=1,
++    )
++    assert first is not None
++    with pytest.raises(ValueError, match="inconsistent contract"):
++        overlay.try_reserve(
++            batch_id=1,
++            request_id="r2",
++            persistent_blocks=10,
++            physical_blocks=10,
++            physical_upper_bound=10,
++            selected_k=2,
++            lookahead_tokens=2,
++            completion_epoch=1,
++        )
++
++
+ def test_atomic_reservation_failure_and_rollback():
+     ledger = HybridKVAdmissionLedger(12, 2)
+     assert (
+@@ -166,6 +228,30 @@ def test_duplicate_or_stale_batch_settlement_fails_closed():
+         ledger.settle_batch(1, {"r": 10}, {"r": 10})
+ 
+ 
++def test_stale_completion_epoch_fails_before_settlement():
++    ledger = HybridKVAdmissionLedger(20, 1)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    reservation = overlay.try_reserve(
++        batch_id=4,
++        request_id="r",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=10,
++        selected_k=3,
++        lookahead_tokens=3,
++        completion_epoch=9,
++    )
++    assert reservation is not None
++    with pytest.raises(ValueError, match="stale completion epoch"):
++        overlay.settle_batch(
++            4,
++            {"r": 10},
++            {"r": 10},
++            completion_epoch=8,
++        )
++    assert overlay.batch_contract(4).completion_epoch == 9
++
++
+ def test_batch_settlement_validation_is_atomic():
+     ledger = HybridKVAdmissionLedger(30, 1)
+     first = reserve(ledger, 1, "r1", 10, 0, 10)
+@@ -255,14 +341,63 @@ def test_fixed_mtp_depth_is_supported(num_spec_tokens: int):
+     validate_hybrid_mtp_admission(**config)
+ 
+ 
++def test_bounded_dynamic_mtp_depths_are_supported():
++    config = valid_mtp_config()
++    config.update(
++        num_spec_tokens=4,
++        num_lookahead_tokens=4,
++        dynamic_speculation=True,
++        dynamic_speculative_depths=(4, 3, 2),
++    )
++    validate_hybrid_mtp_admission(**config)
++
++
++@pytest.mark.parametrize(
++    ("batch_size", "expected"),
++    [(1, (4, 1)), (12, (4, 12)), (16, (3, 16)), (24, (2, 21))],
++)
++def test_graph_aware_depth_and_membership_bound(
++    batch_size: int, expected: tuple[int, int]
++):
++    lookup = [0] + [4] * 12 + [3] * 4 + [2] * 16
++    assert (
++        select_graph_aware_speculative_depth(
++            candidate_count=batch_size,
++            depth_lookup=lookup,
++            max_graph_tokens=64,
++        )
++        == expected
++    )
++
++
++def test_depth_fallback_order_ends_target_only():
++    assert speculative_depth_fallbacks(4) == (4, 3, 2, 0)
++    assert speculative_depth_fallbacks(3) == (3, 2, 0)
++    assert speculative_depth_fallbacks(2) == (2, 0)
++
++
++@pytest.mark.parametrize(
++    "depths", [(1, 2, 3), (2, 4, 8), (), (0, 2, 4)]
++)
++def test_unbounded_dynamic_mtp_depths_fail_closed(depths: tuple[int, ...]):
++    config = valid_mtp_config()
++    config.update(
++        num_spec_tokens=4,
++        num_lookahead_tokens=4,
++        dynamic_speculation=True,
++        dynamic_speculative_depths=depths,
++    )
++    with pytest.raises(ValueError, match="bounded k=2/3/4"):
++        validate_hybrid_mtp_admission(**config)
++
++
+ @pytest.mark.parametrize(
+     ("field", "value", "message"),
+     [
+         ("speculative_method", "draft_model", "built-in MTP"),
+-        ("num_spec_tokens", 0, "fixed-length"),
++        ("num_spec_tokens", 0, "bounded speculation"),
+         ("use_eagle", False, "built-in MTP"),
+-        ("num_lookahead_tokens", 3, "fixed-length"),
+-        ("dynamic_speculation", True, "fixed-length"),
++        ("num_lookahead_tokens", 3, "matching maximum lookahead"),
+         ("model_type", "llama", "Gemma 4"),
+         ("architectures", ("Gemma4TextModel",), "Gemma 4"),
+     ],
+diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+index d75495ea6..9ae3da2a4 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
++++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+@@ -20,6 +20,15 @@ from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
+ pytestmark = pytest.mark.cpu_test
+ 
+ 
++@pytest.fixture(autouse=True)
++def _cpu_graph_pool(monkeypatch):
++    monkeypatch.setattr(
++        gpu_cudagraph_utils.current_platform,
++        "get_global_graph_pool",
++        lambda: None,
++    )
++
++
+ def _create_vllm_config_for_dsd(
+     max_num_seqs: int,
+     max_spec_tokens: int,
+@@ -149,6 +158,28 @@ def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch)
+             assert desc.num_active_loras == 0
+ 
+ 
++def test_dynamic_sd_does_not_change_autoregressive_draft_q1_candidates(monkeypatch):
++    monkeypatch.setattr(
++        gpu_cudagraph_utils,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    vllm_config = _create_vllm_config_for_dsd(
++        max_num_seqs=16,
++        max_spec_tokens=4,
++        num_spec_per_batch_size=[(1, 12, 4), (13, 16, 3)],
++    )
++    manager = gpu_cudagraph_utils.CudaGraphManager(
++        vllm_config=vllm_config,
++        device=torch.device("cpu"),
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        decode_query_len=1,
++    )
++    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
++    assert full_descs
++    assert {desc.uniform_token_count for desc in full_descs} == {1}
++
++
+ def test_dynamic_sd_non_uniform_batch_falls_back_to_piecewise(monkeypatch):
+     """DSD should use PIECEWISE when the batch is not a uniform decode batch.
+ 
+diff --git a/vllm/v1/core/kv_admission.py b/vllm/v1/core/kv_admission.py
+index e4c740f4d..53cdc6ea5 100644
+--- a/vllm/v1/core/kv_admission.py
++++ b/vllm/v1/core/kv_admission.py
+@@ -47,36 +47,6 @@ def validate_hybrid_kv_admission(
+         raise ValueError("hybrid KV admission supports at most two GPU batches")
+ 
+ 
+-def validate_hybrid_mtp_admission(
+-    *,
+-    speculative_method: str | None,
+-    num_spec_tokens: int,
+-    use_eagle: bool,
+-    num_lookahead_tokens: int,
+-    dynamic_speculation: bool,
+-    model_type: str | None,
+-    architectures: tuple[str, ...] | list[str],
+-) -> None:
+-    """Fail closed outside bounded fixed-length Gemma 4 MTP configurations."""
+-    if speculative_method != "mtp" or not use_eagle:
+-        raise ValueError(
+-            "MTP hybrid admission supports only the built-in MTP method"
+-        )
+-    if (
+-        num_spec_tokens < 1
+-        or num_lookahead_tokens != num_spec_tokens
+-        or dynamic_speculation
+-    ):
+-        raise ValueError(
+-            "MTP hybrid admission supports only fixed-length speculation with "
+-            "matching lookahead"
+-        )
+-    if model_type not in ("gemma4", "gemma4_text") or (
+-        "Gemma4ForConditionalGeneration" not in architectures
+-    ):
+-        raise ValueError("MTP hybrid admission supports only Gemma 4")
+-
+-
+ @dataclass(frozen=True)
+ class AdmissionReservation:
+     batch_id: int
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 261a70a3e..4d1e74123 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -40,6 +40,11 @@ from vllm.v1.core.kv_admission import (
+     HybridKVAdmissionLedger,
+     get_request_admission_length,
+     validate_hybrid_kv_admission,
++)
++from vllm.v1.core.speculative_admission import (
++    SpeculativeAdmissionOverlay,
++    select_graph_aware_speculative_depth,
++    speculative_depth_fallbacks,
+     validate_hybrid_mtp_admission,
+ )
+ from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+@@ -328,6 +333,17 @@ class Scheduler(SchedulerInterface):
+                 dynamic_speculation=self.dynamic_sd_lookup is not None,
+                 model_type=model_type,
+                 architectures=architectures,
++                dynamic_speculative_depths=(
++                    tuple(
++                        depth
++                        for _, _, depth in (
++                            speculative_config.num_speculative_tokens_per_batch_size
++                        )
++                    )
++                    if speculative_config is not None
++                    and speculative_config.num_speculative_tokens_per_batch_size
++                    else ()
++                ),
+             )
+         self.kv_cache_manager = KVCacheManager(
+             kv_cache_config=kv_cache_config,
+@@ -352,7 +368,19 @@ class Scheduler(SchedulerInterface):
+             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+ 
+         self.hybrid_kv_admission: HybridKVAdmissionLedger | None = None
++        self.hybrid_kv_speculative_admission: SpeculativeAdmissionOverlay | None = None
+         self._hybrid_kv_batch_seq = 0
++        self._hybrid_no_progress_steps = 0
++        self._hybrid_last_required_growth = 0
++        self._hybrid_admission_blocked = False
++        self._hybrid_last_logged_contract: tuple[int, int] | None = None
++        self._hybrid_dynamic_speculation = bool(
++            use_speculative_admission and self.dynamic_sd_lookup is not None
++        )
++        capture_sizes = (
++            vllm_config.compilation_config.cudagraph_capture_sizes or ()
++        )
++        self._hybrid_max_graph_tokens = max(capture_sizes, default=0)
+         if use_hybrid_kv_admission:
+             capacity_blocks = (
+                 self.kv_cache_manager.block_pool.get_num_free_blocks()
+@@ -362,6 +390,10 @@ class Scheduler(SchedulerInterface):
+                 capacity_blocks=capacity_blocks,
+                 max_in_flight_batches=vllm_config.max_concurrent_batches,
+             )
++            if use_speculative_admission:
++                self.hybrid_kv_speculative_admission = SpeculativeAdmissionOverlay(
++                    self.hybrid_kv_admission
++                )
+             self.defer_block_free = True
+             logger.info(
+                 "Hybrid KV cache admission enabled: capacity=%d blocks, "
+@@ -523,12 +555,45 @@ class Scheduler(SchedulerInterface):
+         )
+         return self.kv_cache_manager.get_admission_blocks(max_total_tokens)
+ 
++    def _select_hybrid_speculative_depth(
++        self, candidate_count: int
++    ) -> tuple[int, int]:
++        """Select k before reservation and return (k, batch-member limit).
++
++        The configured dynamic schedule remains the policy source. The graph
++        limit only bounds membership when even the shallowest supported depth
++        would exceed the largest captured token count.
++        """
++        if candidate_count <= 0 or self.dynamic_sd_lookup is None:
++            return self.num_spec_tokens, max(candidate_count, 1)
++        if not self._hybrid_dynamic_speculation:
++            lookup_index = min(candidate_count, len(self.dynamic_sd_lookup) - 1)
++            selected_k = self.dynamic_sd_lookup[lookup_index]
++            return selected_k, candidate_count
++        return select_graph_aware_speculative_depth(
++            candidate_count=candidate_count,
++            depth_lookup=self.dynamic_sd_lookup,
++            max_graph_tokens=self._hybrid_max_graph_tokens,
++        )
++
++    def _hybrid_admission_diagnostic(self, required_growth: int) -> str:
++        ledger = self.hybrid_kv_admission
++        if ledger is None:
++            return "hybrid admission disabled"
++        return (
++            f"physical_free={self.kv_cache_manager.block_pool.get_num_free_blocks()} "
++            f"charged={ledger.charged_blocks} physical={ledger.physical_blocks} "
++            f"retained={ledger.stranded_blocks} required_crossing={required_growth} "
++            f"in_flight_epochs={tuple(sorted(ledger.batches))}"
++        )
++
+     def _reserve_hybrid_kv_credits(
+         self,
+         request: Request,
+         batch_id: int,
+         requested_tokens: int,
+         num_lookahead_tokens: int,
++        selected_k: int,
+     ) -> tuple[int, AdmissionReservation | None]:
+         ledger = self.hybrid_kv_admission
+         if ledger is None:
+@@ -540,18 +605,43 @@ class Scheduler(SchedulerInterface):
+                 request, tokens, num_lookahead_tokens
+             )
+ 
+-        # Verification is all-or-nothing. Shortening a fixed speculation step
+-        # changes its kernel shape and acceptance contract.
+-        if requested_tokens <= 1 + self.num_spec_tokens:
+-            physical, upper = allocation_bound(requested_tokens)
+-            reservation = ledger.try_reserve(
++        def physical_growth_fits(physical: int, upper: int) -> bool:
++            growth = max(0, upper - physical)
++            self._hybrid_last_required_growth = growth
++            return growth <= self.kv_cache_manager.block_pool.get_num_free_blocks()
++
++        def try_reserve(
++            physical: int, upper: int
++        ) -> AdmissionReservation | None:
++            if self.hybrid_kv_speculative_admission is not None:
++                return self.hybrid_kv_speculative_admission.try_reserve(
++                    batch_id=batch_id,
++                    request_id=request.request_id,
++                    persistent_blocks=persistent_blocks,
++                    physical_blocks=physical,
++                    physical_upper_bound=upper,
++                    selected_k=selected_k,
++                    lookahead_tokens=num_lookahead_tokens,
++                    completion_epoch=batch_id,
++                )
++            return ledger.try_reserve(
+                 batch_id=batch_id,
+                 request_id=request.request_id,
+                 persistent_blocks=persistent_blocks,
+                 physical_blocks=physical,
+                 physical_upper_bound=upper,
+             )
++
++        # Verification is all-or-nothing. Shortening a fixed speculation step
++        # changes its kernel shape and acceptance contract.
++        if requested_tokens <= 1 + self.num_spec_tokens:
++            physical, upper = allocation_bound(requested_tokens)
++            if not physical_growth_fits(physical, upper):
++                self._hybrid_admission_blocked = True
++                return 0, None
++            reservation = try_reserve(physical, upper)
+             if reservation is None:
++                self._hybrid_admission_blocked = True
+                 return 0, None
+             return requested_tokens, reservation
+ 
+@@ -560,7 +650,7 @@ class Scheduler(SchedulerInterface):
+         while low < high:
+             middle = (low + high + 1) // 2
+             physical, upper = allocation_bound(middle)
+-            if ledger.can_reserve(
++            if physical_growth_fits(physical, upper) and ledger.can_reserve(
+                 batch_id=batch_id,
+                 request_id=request.request_id,
+                 persistent_blocks=persistent_blocks,
+@@ -571,18 +661,17 @@ class Scheduler(SchedulerInterface):
+             else:
+                 high = middle - 1
+         if low == 0:
++            self._hybrid_admission_blocked = True
+             return 0, None
+ 
+         physical, upper = allocation_bound(low)
+-        reservation = ledger.try_reserve(
+-            batch_id=batch_id,
+-            request_id=request.request_id,
+-            persistent_blocks=persistent_blocks,
+-            physical_blocks=physical,
+-            physical_upper_bound=upper,
+-        )
++        if not physical_growth_fits(physical, upper):
++            self._hybrid_admission_blocked = True
++            return 0, None
++        reservation = try_reserve(physical, upper)
+         if reservation is None:
+-            raise RuntimeError("hybrid KV admission changed during reservation")
++            self._hybrid_admission_blocked = True
++            return 0, None
+         return low, reservation
+ 
+     def _commit_hybrid_kv_allocation(
+@@ -596,6 +685,40 @@ class Scheduler(SchedulerInterface):
+             reservation, self._request_physical_blocks(request_id)
+         )
+ 
++    def _reserve_hybrid_decode_with_fallback(
++        self,
++        request: Request,
++        batch_id: int,
++        requested_tokens: int,
++        selected_k: int,
++        allow_fallback: bool,
++    ) -> tuple[int, AdmissionReservation | None, int]:
++        """Try depth, then shallower depth, then one target-only token."""
++        candidates = [selected_k]
++        if allow_fallback and self._hybrid_dynamic_speculation:
++            candidates = list(speculative_depth_fallbacks(selected_k))
++        for candidate_k in dict.fromkeys(candidates):
++            candidate_tokens = min(requested_tokens, candidate_k + 1)
++            tokens, reservation = self._reserve_hybrid_kv_credits(
++                request,
++                batch_id,
++                candidate_tokens,
++                candidate_k,
++                candidate_k,
++            )
++            if tokens > 0:
++                if candidate_k != selected_k:
++                    logger.warning(
++                        "Hybrid speculative admission reduced depth k=%d->%d: %s",
++                        selected_k,
++                        candidate_k,
++                        self._hybrid_admission_diagnostic(
++                            self._hybrid_last_required_growth
++                        ),
++                    )
++                return tokens, reservation, candidate_k
++        return 0, None, selected_k
++
+     def _rollback_hybrid_kv_credits(
+         self, reservation: AdmissionReservation | None
+     ) -> None:
+@@ -603,10 +726,14 @@ class Scheduler(SchedulerInterface):
+             return
+         if self.hybrid_kv_admission is None:
+             raise RuntimeError("hybrid KV admission is not configured")
+-        self.hybrid_kv_admission.rollback(reservation)
++        if self.hybrid_kv_speculative_admission is not None:
++            self.hybrid_kv_speculative_admission.rollback(reservation)
++        else:
++            self.hybrid_kv_admission.rollback(reservation)
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._hybrid_admission_blocked = False
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -627,6 +754,13 @@ class Scheduler(SchedulerInterface):
+         num_scheduled_tokens: dict[str, int] = {}
+         token_budget = self.max_num_scheduled_tokens
+         hybrid_kv_batch_id = self._hybrid_kv_batch_seq + 1
++        hybrid_candidate_count = min(
++            self.max_num_running_reqs,
++            len(self.running) + len(self.waiting) + len(self.skipped_waiting),
++        )
++        hybrid_selected_k, hybrid_member_limit = (
++            self._select_hybrid_speculative_depth(hybrid_candidate_count)
++        )
+         if self._pause_state == PauseState.PAUSED_ALL:
+             # Do not schedule any requests when paused.
+             token_budget = 0
+@@ -653,6 +787,11 @@ class Scheduler(SchedulerInterface):
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
++            if (
++                self._hybrid_dynamic_speculation
++                and len(scheduled_running_reqs) >= hybrid_member_limit
++            ):
++                break
+             request = self.running[req_index]
+ 
+             if (
+@@ -744,15 +883,54 @@ class Scheduler(SchedulerInterface):
+ 
+             admission_reservation = None
+             if self.hybrid_kv_admission is not None:
+-                num_new_tokens, admission_reservation = (
+-                    self._reserve_hybrid_kv_credits(
++                # The bounded speculative fallback contract applies only to
++                # decode/verification work.  A RUNNING request can still be
++                # consuming a chunked prefill; truncating that chunk to k + 1
++                # turns normal prefill into a sequence of tiny decode-shaped
++                # launches and is not part of speculative admission.
++                if (
++                    self._hybrid_dynamic_speculation
++                    and not request.is_prefill_chunk
++                ):
++                    (
++                        num_new_tokens,
++                        admission_reservation,
++                        reserved_k,
++                    ) = self._reserve_hybrid_decode_with_fallback(
+                         request,
+                         hybrid_kv_batch_id,
+                         num_new_tokens,
+-                        self.num_lookahead_tokens,
++                        hybrid_selected_k,
++                        allow_fallback=not scheduled_running_reqs,
++                    )
++                    if reserved_k != hybrid_selected_k:
++                        hybrid_selected_k = reserved_k
++                        if self._hybrid_max_graph_tokens:
++                            hybrid_member_limit = max(
++                                1,
++                                self._hybrid_max_graph_tokens // (reserved_k + 1),
++                            )
++                else:
++                    num_new_tokens, admission_reservation = (
++                        self._reserve_hybrid_kv_credits(
++                            request,
++                            hybrid_kv_batch_id,
++                            num_new_tokens,
++                            (
++                                hybrid_selected_k
++                                if self._hybrid_dynamic_speculation
++                                else self.num_lookahead_tokens
++                            ),
++                            (
++                                hybrid_selected_k
++                                if self._hybrid_dynamic_speculation
++                                else self.num_spec_tokens
++                            ),
++                        )
+                     )
+-                )
+                 if num_new_tokens == 0:
++                    if scheduled_running_reqs:
++                        break
+                     req_index += 1
+                     continue
+ 
+@@ -762,7 +940,11 @@ class Scheduler(SchedulerInterface):
+                     new_blocks = self.kv_cache_manager.allocate_slots(
+                         request,
+                         num_new_tokens,
+-                        num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_lookahead_tokens=(
++                            hybrid_selected_k
++                            if self._hybrid_dynamic_speculation
++                            else self.num_lookahead_tokens
++                        ),
+                     )
+ 
+                     if new_blocks is not None:
+@@ -1115,7 +1297,13 @@ class Scheduler(SchedulerInterface):
+                 # mismatching local and remote block counts.
+                 limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
+                 effective_lookahead_tokens = (
+-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
++                    0
++                    if limit_lookahead_tokens
++                    else (
++                        hybrid_selected_k
++                        if self._hybrid_dynamic_speculation
++                        else self.num_lookahead_tokens
++                    )
+                 )
+ 
+                 # Determine if we need to allocate cross-attention blocks.
+@@ -1146,6 +1334,7 @@ class Scheduler(SchedulerInterface):
+                             hybrid_kv_batch_id,
+                             num_new_tokens,
+                             effective_lookahead_tokens,
++                            hybrid_selected_k,
+                         )
+                     )
+                     if num_new_tokens == 0:
+@@ -1354,9 +1543,13 @@ class Scheduler(SchedulerInterface):
+             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+         pending_kv_cache_block_copies = kv_cache_block_copies or None
+ 
+-        # Dynamic speculative decoding: compute optimal K
++        # Dynamic speculative decoding. Hybrid admission selected k before any
++        # reservation; non-hybrid configurations retain the upstream late
++        # lookup behavior.
+         num_spec_tokens_to_schedule = self.num_spec_tokens
+-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
++        if self._hybrid_dynamic_speculation and len(num_scheduled_tokens) > 0:
++            num_spec_tokens_to_schedule = hybrid_selected_k
++        elif self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+             ]
+@@ -1379,6 +1572,63 @@ class Scheduler(SchedulerInterface):
+                 raise RuntimeError("hybrid KV reservation has no scheduled work")
+             admission_batch_id = hybrid_kv_batch_id
+             self._hybrid_kv_batch_seq = hybrid_kv_batch_id
++            if self.hybrid_kv_speculative_admission is None:
++                contract = None
++            else:
++                contract = self.hybrid_kv_speculative_admission.batch_contract(
++                    admission_batch_id
++                )
++            if contract is not None and contract.selected_k != num_spec_tokens_to_schedule:
++                raise RuntimeError(
++                    "speculative batch contract differs from execution depth: "
++                    f"contract={contract.selected_k}, execution={num_spec_tokens_to_schedule}"
++                )
++            contract_signature = (
++                (contract.selected_k, len(contract.request_ids))
++                if contract is not None
++                else None
++            )
++            if (
++                contract is not None
++                and self.observability_config.enable_logging_iteration_details
++                and contract_signature != self._hybrid_last_logged_contract
++            ):
++                logger.info(
++                    "Hybrid speculative batch: batch=%d k=%d lookahead=%d "
++                    "members=%d target_tokens=%d completion_epoch=%d",
++                    admission_batch_id,
++                    contract.selected_k,
++                    contract.lookahead_tokens,
++                    len(contract.request_ids),
++                    total_num_scheduled_tokens,
++                    contract.completion_epoch,
++                )
++                self._hybrid_last_logged_contract = contract_signature
++
++        if (
++            self.hybrid_kv_admission is not None
++            and self.running
++            and total_num_scheduled_tokens == 0
++            and self._hybrid_admission_blocked
++        ):
++            self._hybrid_no_progress_steps += 1
++            if not self.hybrid_kv_admission.batches:
++                raise RuntimeError(
++                    "hybrid KV admission cannot advance even one target-only "
++                    "request: "
++                    + self._hybrid_admission_diagnostic(
++                        self._hybrid_last_required_growth
++                    )
++                )
++            if self._hybrid_no_progress_steps % 8 == 0:
++                logger.warning(
++                    "Hybrid KV admission no-progress watchdog: %s",
++                    self._hybrid_admission_diagnostic(
++                        self._hybrid_last_required_growth
++                    ),
++                )
++        else:
++            self._hybrid_no_progress_steps = 0
+ 
+         scheduler_output = SchedulerOutput(
+             scheduled_new_reqs=new_reqs_data,
+@@ -2133,11 +2383,19 @@ class Scheduler(SchedulerInterface):
+                     continue
+                 physical_blocks[req_id] = self._request_physical_blocks(req_id)
+                 admission_blocks[req_id] = self._request_admission_blocks(request)
+-            self.hybrid_kv_admission.settle_batch(
+-                admission_batch_id,
+-                physical_blocks=physical_blocks,
+-                persistent_blocks=admission_blocks,
+-            )
++            if self.hybrid_kv_speculative_admission is not None:
++                self.hybrid_kv_speculative_admission.settle_batch(
++                    admission_batch_id,
++                    physical_blocks=physical_blocks,
++                    persistent_blocks=admission_blocks,
++                    completion_epoch=admission_batch_id,
++                )
++            else:
++                self.hybrid_kv_admission.settle_batch(
++                    admission_batch_id,
++                    physical_blocks=physical_blocks,
++                    persistent_blocks=admission_blocks,
++                )
+ 
+         # KV Connector: update state for finished KV Transfers.
+         if kv_connector_output:
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index 27fd55472..a0e4b5786 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -197,10 +197,13 @@ class CudaGraphManager:
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
+-        if (
++        target_dynamic_decode = (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+-        ):
++            and self.decode_query_len
++            == self.vllm_config.num_speculative_tokens + 1
++        )
++        if target_dynamic_decode:
+             num_spec_per_batch_size = (
+                 speculative_config.num_speculative_tokens_per_batch_size
+             )
+@@ -217,6 +220,9 @@ class CudaGraphManager:
+                 x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+             ]
+         else:
++            # Autoregressive draft managers execute one token per recurrence.
++            # They share the top-level speculative config, but must not inherit
++            # the target's variable q=k+1 graph candidates.
+             decode_query_lens = [self.decode_query_len]
+ 
+         for num_tokens, num_active_loras in product(

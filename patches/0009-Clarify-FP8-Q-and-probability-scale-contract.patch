@@ -1,0 +1,123 @@
+diff --git a/vllm/model_executor/layers/quantization/kv_cache.py b/vllm/model_executor/layers/quantization/kv_cache.py
+index 380ad33f2..25c318efc 100644
+--- a/vllm/model_executor/layers/quantization/kv_cache.py
++++ b/vllm/model_executor/layers/quantization/kv_cache.py
+@@ -79,6 +79,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+             assert not hasattr(layer, "prob_scale")
+             return
+ 
++        q_scale_missing = bool((layer.q_scale < 0.0).item())
++
+         # Per-token-head quantized KV cache: scales are computed dynamically
+         # per (token, head) in the kernel at cache-write time.  Checkpoint
+         # scales are never used regardless of calculate_kv_scales.
+@@ -130,15 +132,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+                     "Only support per-tensor scaling factor for fp8 KV cache"
+                 )
+ 
+-            if layer.q_scale < 0.0:
+-                logger.warning_once(
+-                    "Checkpoint does not provide a q scaling factor. "
+-                    "Setting it to k_scale. This only matters for "
+-                    "FP8 Attention backends (flash-attn or flashinfer)."
+-                )
+-                layer._q_scale.copy_(k_scale)
+-                layer._q_scale_float = k_scale
+-
+             # These are used in the final Attention.forward()
+             layer._k_scale.copy_(k_scale)
+             layer._v_scale.copy_(v_scale)
+@@ -186,12 +179,28 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+         )
+ 
+         layer._prob_scale.copy_(prob_scale)
+-        if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
+-            logger.warning_once(
+-                f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
+-                f"{prob_scale} with fp8 attention. This may cause accuracy "
+-                "issues. Please make sure q/prob scaling factors are "
+-                "available in the fp8 checkpoint."
++        layer._prob_scale_float = (
++            prob_scale.item() if isinstance(prob_scale, torch.Tensor) else prob_scale
++        )
++
++        # Q and probability scales have different ownership and consumers from
++        # the persistent K/V-cache scales. In particular, an absent Q scale is
++        # not a request to reuse k_scale. The old fallback write was overwritten
++        # by the identity value below and its warning omitted Triton, which also
++        # supports pre-quantized queries. Report the actual selected contract,
++        # and only when this layer really has a quantized-query consumer.
++        query_quant = getattr(layer, "query_quant", None)
++        impl = getattr(layer, "impl", None)
++        if (
++            q_scale_missing
++            and query_quant is not None
++            and getattr(impl, "supports_quant_query_input", False)
++        ):
++            logger.info_once(
++                "Checkpoint does not provide an attention Q scale; %s uses "
++                "pre-quantized queries, so vLLM is using identity q_scale=1.0. "
++                "This is independent of the checkpoint's K/V-cache scales.",
++                type(impl).__name__,
+             )
+ 
+         del layer.k_scale
+diff --git a/tests/quantization/test_kv_cache_scale_contract.py b/tests/quantization/test_kv_cache_scale_contract.py
+new file mode 100644
+index 000000000..ecdf26faf
+--- /dev/null
++++ b/tests/quantization/test_kv_cache_scale_contract.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.attention.attention import set_default_quant_scales
++from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
++
++
++def make_layer(*, quantized_query: bool) -> torch.nn.Module:
++    layer = torch.nn.Module()
++    set_default_quant_scales(layer, register_buffer=True)
++    layer.kv_cache_dtype = "fp8"
++    layer.calculate_kv_scales = False
++    layer.query_quant = object() if quantized_query else None
++    layer.impl = SimpleNamespace(supports_quant_query_input=quantized_query)
++    method = BaseKVCacheMethod(quant_config=None)
++    method.create_weights(layer)
++    layer.k_scale.weight_loader(layer.k_scale, torch.tensor(0.0035))
++    layer.v_scale.weight_loader(layer.v_scale, torch.tensor(0.0356))
++    return layer
++
++
++@pytest.mark.parametrize("quantized_query", [False, True])
++def test_missing_q_and_prob_scales_do_not_inherit_kv_scales(
++    quantized_query: bool,
++) -> None:
++    layer = make_layer(quantized_query=quantized_query)
++
++    BaseKVCacheMethod(quant_config=None).process_weights_after_loading(layer)
++
++    assert layer._k_scale_float == pytest.approx(0.0035)
++    assert layer._v_scale_float == pytest.approx(0.0356)
++    assert layer._q_scale_float == 1.0
++    assert layer._prob_scale_float == 1.0
++    assert layer._q_scale.item() == 1.0
++    assert layer._prob_scale.item() == 1.0
++
++
++def test_checkpoint_q_and_prob_scales_remain_independent() -> None:
++    layer = make_layer(quantized_query=True)
++    layer.q_scale.weight_loader(layer.q_scale, torch.tensor(0.125))
++    layer.prob_scale.weight_loader(layer.prob_scale, torch.tensor(0.25))
++
++    BaseKVCacheMethod(quant_config=None).process_weights_after_loading(layer)
++
++    assert layer._q_scale_float == pytest.approx(0.125)
++    assert layer._prob_scale_float == pytest.approx(0.25)
++    assert layer._q_scale.item() == pytest.approx(0.125)
++    assert layer._prob_scale.item() == pytest.approx(0.25)
