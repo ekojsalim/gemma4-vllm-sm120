@@ -1,23 +1,23 @@
 # Modified vLLM files
 
-Every file under `overlay/vllm/` is a modified or newly added runtime file for
-the Gemma 4 SM120 deployment. The exact file list is
-`manifests/runtime-files.txt`; the corresponding review series is under
-`patches/`.
+Each directory under `versions/` is an independently validated derivative of a
+specific vLLM base. Its `manifests/runtime-files.txt` lists every modified or
+new runtime file, and its `patches/` directory records the reviewable changes.
 
-The changes provide:
+The vLLM 0.26 bundle provides:
 
 - language-only Gemma 4 attention selection;
 - bounded small-M segmented Triton attention;
 - transactional hybrid-KV admission and a separate speculative overlay;
 - shared FP8 KV-scale ownership;
-- bounded graph-aware speculative depth support;
+- bounded graph-aware speculative-depth integration;
 - optional assistant FP8 configuration;
 - node-local tune-once/freeze FlashInfer NVFP4 profiles; and
 - corrected optional Q/probability-scale handling and warnings.
 
-The runtime overlay is compatible only with the base-image and per-file
-contracts recorded in `manifests/base-files.sha256`. It does not contain model
-weights, tokenizer files, prompts, benchmark corpora, tactic profiles, or
-private deployment configuration.
+These modifications are not assumed to apply to another vLLM release. See the
+corresponding compatibility assessment before porting them.
+
+No bundle contains model weights, tokenizer files, prompts, benchmark corpora,
+generated tactic profiles, private deployment paths, or credentials.
 

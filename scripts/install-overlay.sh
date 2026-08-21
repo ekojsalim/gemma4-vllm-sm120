@@ -2,8 +2,19 @@
 set -Eeuo pipefail
 
 release_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-package_root=${VLLM_SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}
-expected_version=0.26.0
+[[ -f "${release_root}/release.env" ]] || {
+  printf '[gemma4-overlay] ERROR: release.env is missing\n' >&2
+  exit 1
+}
+# shellcheck disable=SC1090
+source "${release_root}/release.env"
+
+: "${BUNDLE_VERSION:?}"
+: "${VLLM_VERSION:?}"
+: "${VLLM_IMAGE_DIGEST:?}"
+: "${PYTHON_SITE_PACKAGES:?}"
+
+package_root=${VLLM_SITE_PACKAGES:-${PYTHON_SITE_PACKAGES}}
 lock_file=${VLLM_OVERLAY_LOCK_FILE:-/tmp/gemma4-vllm-sm120-overlay.lock}
 
 log() {
@@ -17,13 +28,14 @@ die() {
 
 [[ -d "${package_root}/vllm" ]] || die "vLLM package not found under ${package_root}"
 [[ -f "${release_root}/VERSION" ]] || die "release VERSION is missing"
-[[ "$(<"${release_root}/VERSION")" == "0.1.0" ]] || die "unexpected overlay release version"
+[[ "$(<"${release_root}/VERSION")" == "${BUNDLE_VERSION}" ]] || \
+  die "VERSION and release.env disagree"
 
 installed_version=$(
   python3 -c 'from importlib.metadata import version; print(version("vllm"))'
 )
-[[ "${installed_version}" == "${expected_version}" ]] || \
-  die "expected vLLM ${expected_version}, found ${installed_version}"
+[[ "${installed_version}" == "${VLLM_VERSION}" ]] || \
+  die "expected vLLM ${VLLM_VERSION}, found ${installed_version}"
 
 command -v flock >/dev/null 2>&1 || die "flock is required for serialized installation"
 exec 9>"${lock_file}"
@@ -62,7 +74,7 @@ while read -r expected path; do
 done <"${release_root}/manifests/base-files.sha256"
 
 if [[ "${needs_install}" == 0 ]]; then
-  log "overlay 0.1.0 is already installed and byte-identical"
+  log "overlay ${BUNDLE_VERSION} is already installed and byte-identical"
   exit 0
 fi
 
@@ -83,5 +95,6 @@ while read -r expected source_path; do
   [[ "${actual}" == "${expected}" ]] || die "installed checksum mismatch: ${path}"
 done <"${release_root}/manifests/overlay-files.sha256"
 
-log "installed and verified overlay 0.1.0 for vLLM ${installed_version}"
+log "installed overlay ${BUNDLE_VERSION} for vLLM ${installed_version}"
+log "validated base image contract ${VLLM_IMAGE_DIGEST}"
 
