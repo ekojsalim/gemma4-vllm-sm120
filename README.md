@@ -64,3 +64,11 @@ capacity because its driver and OCR runtime may reserve different memory.
 No checkpoint, Hugging Face cache, prompts, corpus data, generated tactic map,
 or node secret is published here.
 
+
+## OCR deployment update
+
+The September 6, 2026 OCR bundle adds shared GPU workspace, cropped-line
+recognition, short-line profiles, and a fix for small/wide/tall full-page
+inputs. It is delivered through the existing Hugging Face OCR repository; the
+vLLM overlay release and startup gist remain compatible. See
+[deployment and validation details](docs/deployment.md#ocr-bundle-update-2026-09-06).
