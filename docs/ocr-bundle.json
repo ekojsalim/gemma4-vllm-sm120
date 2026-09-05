@@ -1,0 +1,60 @@
+{
+  "name": "ppocrv6-tensorrt-ocr-bundle",
+  "bundle_version": "2026-09-06-v8",
+  "bundle_runtime": "cuda13-trt10.14",
+  "tensor_rt_package_version": "10.14.1.48-1+cuda13.0",
+  "target_gpu": "RTX 5090 / sm120 deployment bundle",
+  "server_image": "localhost/ppocrv6-vllm-ocr:dev",
+  "server_image_id": "841db5105303b2278dfa7725ecd9792824d9f9cb95dcfddaa923842c0d8dbaf7",
+  "server_binary_sha256": "a04f1e8c4257a936dd20c974bd638f3dcb3cea88311367a28e778fe0ec5006f1",
+  "native_library_sha256": "fa3ed8b70cdc16bff61c038bbd2a2fdbf9f4476224e0a5a6474bb7de57aa94e7",
+  "detector_engine": "engines/det-fp16-b1-h256-1280-w256-1280.trt",
+  "detector_engine_sha256": "d5e977f8c8949f8d4105284d0b8b09fd9e736bda4a290d237afc35ed08a3ad60",
+  "recognizer_engine": "engines/rec-hidden-multiprofile-glyph-line.trt",
+  "recognizer_engine_sha256": "7977ff9bcca78eb28cf9f972ff0cc67b04f7cc5edbf8b034891ceb76b5052125",
+  "glyph_defaults": {
+    "max_images_per_request": 1024,
+    "max_tensor_rt_batch_size": 256,
+    "character_policy": "cjk_focus_fallback",
+    "score_mode": "accepted",
+    "one_stroke_fallback_token": "\u4e00",
+    "one_stroke_fallback_min_probability": 0.005
+  },
+  "runtime_features": [
+    "One shared recognizer engine and classifier allocation.",
+    "CUDA detector preprocessing and CUDA ROI/recognition preprocessing.",
+    "Pinned host buffers and long-lived CUDA events/streams.",
+    "CJK-focused glyph recognition with a dedicated one-stroke fallback for \u4e00 only.",
+    "Accepted glyph scores by default, with model probability mode available per request.",
+    "Accepted mode skips vocabulary-wide probability reduction; blank fallback evaluates only the \u4e00 classifier column.",
+    "Aspect-preserving containment with white padding for width-overflow glyph images.",
+    "Profile-aware OCR line bucketing compatible with two- and three-profile recognizer engines.",
+    "Detector, glyph, and line/page contexts share a maximum-sized enqueue workspace reserved at startup.",
+    "Cropped-line recognition at /v1/lines/recognize shares its recognizer with full-page OCR.",
+    "Parallel CPU preprocessing of large cropped-line batches.",
+    "Three recognition profiles: glyph, short line, long line; line buckets 128,256,384,512,640,960,1280,1600,2400,3200.",
+    "Small/extreme-aspect full pages receive white detector padding excluded from box extraction; source coordinates are preserved."
+  ],
+  "notes": [
+    "TensorRT engine plans are runtime-version and GPU-target sensitive.",
+    "Use this bundle with the vLLM CUDA 13 / TensorRT 10.14 runtime path.",
+    "Build a separate engine bundle for the NGC TensorRT 26.03 runtime."
+  ],
+  "validated_vllm_version": "0.26.0",
+  "validation": {
+    "gpu": "RTX 5090",
+    "kv_cache_memory_bytes": 9506652160,
+    "max_num_seqs": 32,
+    "mixed_llm_requests": 96,
+    "mixed_ocr_requests": 360,
+    "max_observed_running_sequences": 32,
+    "max_observed_kv_usage": 0.9049917264202978,
+    "min_sampled_free_mib": 236,
+    "detector_padding_blank_shapes": 18,
+    "detector_padding_coordinate_controls": 5,
+    "notes": "Mixed-load validation preceded the detector-padding-only fix; the final padded runtime passed page/glyph/line regressions with vLLM resident at unchanged warm memory. Not a remote Vast boot or production accuracy benchmark."
+  },
+  "huggingface_repository": "ekojs/ppocrv6-tensorrt-ocr-bundle",
+  "huggingface_revision": "cf88fd53833f9b9729fb6506ae9d518c78794441",
+  "previous_huggingface_revision": "60da8267b157e247a5a681e65d2757afe475e7b4"
+}
