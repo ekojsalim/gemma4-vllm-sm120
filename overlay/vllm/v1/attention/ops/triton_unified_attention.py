@@ -325,9 +325,7 @@ def kernel_unified_attention(
     if IS_3D:
         if ROW_EQUIVALENT_3D:
             q_block_first = q_block_local_idx * BLOCK_Q
-            q_block_last = tl.minimum(
-                q_block_first + BLOCK_Q, cur_batch_query_len
-            ) - 1
+            q_block_last = tl.minimum(q_block_first + BLOCK_Q, cur_batch_query_len) - 1
             first_row_seq_len = context_len + q_block_first + 1
             last_row_seq_len = context_len + q_block_last + 1
             min_tiles_per_segment = cdiv_fn(
@@ -340,9 +338,7 @@ def kernel_unified_attention(
             if segm_idx * min_tiles_per_segment * TILE_SIZE >= last_row_seq_len:
                 return
         else:
-            tiles_per_segment = cdiv_fn(
-                seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
-            )
+            tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
             min_tiles_per_segment = tiles_per_segment
             max_tiles_per_segment = tiles_per_segment
             if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
@@ -432,12 +428,17 @@ def kernel_unified_attention(
         BLOCK_Q,
         num_queries_per_kv,
         SLIDING_WINDOW,
-        USE_MM_PREFIX or USE_R_SWA,
+        USE_MM_PREFIX,
         IS_3D and not ROW_EQUIVALENT_3D,
         USE_CAUSAL,
         USE_PER_SEQ_CAUSAL,
         CHUNK_LOOKBACK,
         CHUNK_SIZE,
+        USE_R_SWA,
+        MM_PREFIX_CLAMP_SW,
+        MAX_MM_RANGES,
+        mm_prefix_range_ptr,
+        seq_idx,
     )
     if ROW_EQUIVALENT_3D:
         loop_lo = tl.maximum(loop_lo, segm_idx * min_tiles_per_segment)

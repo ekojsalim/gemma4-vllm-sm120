@@ -16,6 +16,53 @@ from vllm.v1.core.speculative_admission import (
 )
 
 
+def test_hybrid_admission_bound_covers_real_cache_allocation():
+    """Exercise the port against real 0.31 managers, not just ledger arithmetic."""
+    import torch
+
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+    from vllm.v1.request import Request
+
+    register_all_kvcache_specs(None)
+    common = dict(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float16)
+    config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full"], FullAttentionSpec(**common)),
+            KVCacheGroupSpec(
+                ["sliding"], SlidingWindowSpec(**common, sliding_window=32)
+            ),
+        ],
+    )
+    manager = KVCacheManager(
+        config,
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        max_in_flight_tokens=0,
+        enable_caching=False,
+    )
+    assert manager.get_admission_blocks(128) == 11  # 8 full + 3 sliding
+    request = Request(
+        "probe", [1] * 31, SamplingParams(max_tokens=32), pooling_params=None
+    )
+    physical, upper = manager.prepare_speculative_allocation(request, 31, 4)
+    assert physical == 0
+    assert manager.allocate_slots(request, 31, num_lookahead_tokens=4) is not None
+    actual = sum(len(ids) for ids in manager.get_unique_physical_block_ids("probe"))
+    assert 0 < actual <= upper
+    manager.free(request)
+
+
 def reserve(
     ledger: HybridKVAdmissionLedger,
     batch_id: int,
@@ -376,9 +423,7 @@ def test_depth_fallback_order_ends_target_only():
     assert speculative_depth_fallbacks(2) == (2, 0)
 
 
-@pytest.mark.parametrize(
-    "depths", [(1, 2, 3), (2, 4, 8), (), (0, 2, 4)]
-)
+@pytest.mark.parametrize("depths", [(1, 2, 3), (2, 4, 8), (), (0, 2, 4)])
 def test_unbounded_dynamic_mtp_depths_fail_closed(depths: tuple[int, ...]):
     config = valid_mtp_config()
     config.update(

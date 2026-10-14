@@ -34,15 +34,11 @@ def validate_hybrid_kv_admission(
     if has_connector:
         raise ValueError("hybrid KV admission does not support connectors")
     if is_encoder_decoder or has_mamba_layers:
-        raise ValueError(
-            "hybrid KV admission supports decoder-only attention caches"
-        )
+        raise ValueError("hybrid KV admission supports decoder-only attention caches")
     if prefix_caching:
         raise ValueError("hybrid KV admission requires prefix caching disabled")
     if not cache_groups_supported:
-        raise ValueError(
-            "hybrid KV admission supports only SWA/full-attention groups"
-        )
+        raise ValueError("hybrid KV admission supports only SWA/full-attention groups")
     if max_concurrent_batches > 2:
         raise ValueError("hybrid KV admission supports at most two GPU batches")
 
@@ -157,13 +153,16 @@ class HybridKVAdmissionLedger:
         physical_blocks: int,
         physical_upper_bound: int,
     ) -> bool:
-        return self._staged_charge(
-            batch_id=batch_id,
-            request_id=request_id,
-            persistent_blocks=persistent_blocks,
-            physical_blocks=physical_blocks,
-            physical_upper_bound=physical_upper_bound,
-        ) <= self.capacity_blocks
+        return (
+            self._staged_charge(
+                batch_id=batch_id,
+                request_id=request_id,
+                persistent_blocks=persistent_blocks,
+                physical_blocks=physical_blocks,
+                physical_upper_bound=physical_upper_bound,
+            )
+            <= self.capacity_blocks
+        )
 
     def try_reserve(
         self,
@@ -175,9 +174,7 @@ class HybridKVAdmissionLedger:
         physical_upper_bound: int,
     ) -> AdmissionReservation | None:
         """Atomically reserve one request's exact allocation upper bound."""
-        self._validate_counts(
-            persistent_blocks, physical_blocks, physical_upper_bound
-        )
+        self._validate_counts(persistent_blocks, physical_blocks, physical_upper_bound)
         if request_id in self.retired:
             raise ValueError(f"request {request_id!r} is retired")
         batch = self.batches.get(batch_id)
@@ -201,9 +198,7 @@ class HybridKVAdmissionLedger:
         previous_batch_bound = (
             batch.physical_upper_bounds.get(request_id) if batch else None
         )
-        self.persistent[request_id] = max(
-            persistent_blocks, previous_persistent or 0
-        )
+        self.persistent[request_id] = max(persistent_blocks, previous_persistent or 0)
         self.physical[request_id] = physical_blocks
         if batch is None:
             batch = self.batches.setdefault(batch_id, _BatchReservation())
@@ -331,9 +326,7 @@ class HybridKVAdmissionLedger:
         physical_blocks: int,
         physical_upper_bound: int,
     ) -> int:
-        self._validate_counts(
-            persistent_blocks, physical_blocks, physical_upper_bound
-        )
+        self._validate_counts(persistent_blocks, physical_blocks, physical_upper_bound)
         if request_id in self.retired:
             return self.capacity_blocks + 1
         batch = self.batches.get(batch_id)
@@ -354,11 +347,15 @@ class HybridKVAdmissionLedger:
         return total
 
     def _active_request_ids(self) -> set[str]:
-        active = self.persistent.keys() | self.physical.keys() | {
-            request_id
-            for batch in self.batches.values()
-            for request_id in batch.physical_upper_bounds
-        }
+        active = (
+            self.persistent.keys()
+            | self.physical.keys()
+            | {
+                request_id
+                for batch in self.batches.values()
+                for request_id in batch.physical_upper_bounds
+            }
+        )
         return set(active).difference(self.retired)
 
     def _request_batch_bound(self, request_id: str) -> int:

@@ -1,0 +1,3416 @@
+diff --git a/tests/kernels/attention/test_triton_unified_attention.py b/tests/kernels/attention/test_triton_unified_attention.py
+index e30d9225e..3a7589170 100644
+--- a/tests/kernels/attention/test_triton_unified_attention.py
++++ b/tests/kernels/attention/test_triton_unified_attention.py
+@@ -599,6 +599,447 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
+     )
+ 
+ 
++@pytest.mark.parametrize("query_len", [2, 3])
++@torch.inference_mode()
++def test_triton_swa_single_block_matches_sequential_rows(query_len: int) -> None:
++    """A small SWA query block must preserve sequential decode reductions."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    sliding_window = 64
++    context_len = 128 - query_len
++    seq_len = context_len + query_len
++    num_query_heads = 4
++    num_kv_heads = 2
++    head_size = 256
++    scale = head_size**-0.5
++
++    query = torch.ones(query_len, num_query_heads, head_size, dtype=torch.bfloat16)
++    key = -torch.rand(seq_len, num_kv_heads, head_size, dtype=torch.bfloat16)
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (
++        (key / k_scale).to(FP8_DTYPE).view(-1, block_size, num_kv_heads, head_size)
++    )
++    value_cache = (value / v_scale).to(FP8_DTYPE).view_as(key_cache)
++    block_table = torch.arange(key_cache.shape[0], dtype=torch.int32).unsqueeze(0)
++    scale_shape = (1, num_kv_heads)
++    k_descale = torch.full(scale_shape, k_scale.item(), dtype=torch.float32)
++    v_descale = torch.full(scale_shape, v_scale.item(), dtype=torch.float32)
++
++    def run(q: torch.Tensor, length: int) -> torch.Tensor:
++        output = torch.empty_like(q)
++        unified_attention(
++            q=q,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=torch.tensor([0, len(q)], dtype=torch.int32),
++            max_seqlen_q=len(q),
++            seqused_k=torch.tensor([length], dtype=torch.int32),
++            max_seqlen_k=length,
++            softmax_scale=scale,
++            causal=True,
++            window_size=(sliding_window - 1, 0),
++            block_table=block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=k_descale,
++            v_descale=v_descale,
++            seq_threshold_3D=0,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(query, seq_len)
++    sequential_output = torch.cat(
++        [run(query[row : row + 1], context_len + row + 1) for row in range(query_len)]
++    )
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize(
++    ("head_size", "sliding_window", "context_len"),
++    [
++        (256, 1024, 254),
++        (256, 1024, 1022),
++        (512, None, 254),
++    ],
++)
++@pytest.mark.parametrize("query_len", [2, 3])
++@pytest.mark.parametrize("batch_size", [1, 4, 8])
++@torch.inference_mode()
++def test_triton_small_m_3d_matches_sequential_decode_rows(
++    head_size: int,
++    sliding_window: int | None,
++    context_len: int,
++    query_len: int,
++    batch_size: int,
++) -> None:
++    """Bounded 3D verification must reproduce each q=1 reduction."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    num_query_heads = 32
++    num_kv_heads = 16
++    seq_threshold_3d = 8
++    num_segments = 16
++    seq_len = context_len + query_len
++    blocks_per_seq = (seq_len + block_size - 1) // block_size
++    num_blocks = batch_size * blocks_per_seq
++    scale = head_size**-0.5
++
++    query = torch.randn(
++        batch_size * query_len,
++        num_query_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    key = torch.randn(
++        num_blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(num_blocks, dtype=torch.int32).view(
++        batch_size, blocks_per_seq
++    )
++    query_start = torch.arange(
++        0,
++        (batch_size + 1) * query_len,
++        query_len,
++        dtype=torch.int32,
++    )
++    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32)
++    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
++
++    scratch_tokens = seq_threshold_3d * 3
++    scratch_output = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        dtype=torch.float32,
++    )
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def run(
++        run_query: torch.Tensor,
++        run_query_start: torch.Tensor,
++        run_seq_lens: torch.Tensor,
++        run_block_table: torch.Tensor,
++        run_max_query_len: int,
++    ) -> torch.Tensor:
++        output = torch.empty_like(run_query)
++        num_run_seqs = len(run_seq_lens)
++        descale_shape = (num_run_seqs, num_kv_heads)
++        unified_attention(
++            q=run_query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=run_query_start,
++            max_seqlen_q=run_max_query_len,
++            seqused_k=run_seq_lens,
++            max_seqlen_k=int(run_seq_lens.max()),
++            softmax_scale=scale,
++            causal=True,
++            window_size=window_size,
++            block_table=run_block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=torch.full(descale_shape, k_scale.item(), dtype=torch.float32),
++            v_descale=torch.full(descale_shape, v_scale.item(), dtype=torch.float32),
++            seq_threshold_3D=seq_threshold_3d,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(
++        query,
++        query_start,
++        seq_lens,
++        block_table,
++        query_len,
++    )
++    sequential_rows = []
++    if batch_size > seq_threshold_3d:
++        for row in range(query_len):
++            sequential_rows.append(
++                run(
++                    query.reshape(
++                        batch_size,
++                        query_len,
++                        num_query_heads,
++                        head_size,
++                    )[:, row],
++                    torch.arange(batch_size + 1, dtype=torch.int32),
++                    torch.full(
++                        (batch_size,),
++                        context_len + row + 1,
++                        dtype=torch.int32,
++                    ),
++                    block_table,
++                    1,
++                )
++            )
++        sequential_output = torch.stack(sequential_rows, dim=1).flatten(0, 1)
++    else:
++        for sequence in range(batch_size):
++            sequence_start = sequence * query_len
++            for row in range(query_len):
++                sequential_rows.append(
++                    run(
++                        query[sequence_start + row : sequence_start + row + 1],
++                        torch.tensor([0, 1], dtype=torch.int32),
++                        torch.tensor([context_len + row + 1], dtype=torch.int32),
++                        block_table[sequence : sequence + 1],
++                        1,
++                    )
++                )
++        sequential_output = torch.cat(sequential_rows)
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@torch.inference_mode()
++def test_triton_small_m_uses_2d_above_sequence_threshold() -> None:
++    """Batch 9 must retain the established 2D q=1/q=3 geometry."""
++    test_triton_small_m_3d_matches_sequential_decode_rows(
++        head_size=256,
++        sliding_window=1024,
++        context_len=254,
++        query_len=3,
++        batch_size=9,
++    )
++
++
++@torch.inference_mode()
++def test_triton_small_m_3d_mixed_rows_and_segment_boundaries() -> None:
++    """Mixed q=1/2/3 rows keep their own segment and SWA tile geometry."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    sliding_window = 1024
++    head_size = 256
++    num_query_heads = 32
++    num_kv_heads = 16
++    num_segments = 16
++    seq_threshold_3d = 8
++    query_lens = [1, 2, 3, 3, 2, 1]
++    # Includes an empty final segment, partial tiles, a tiles-per-segment
++    # transition, the 1,024-token boundary, and a later logical wrap.
++    context_lens = [14, 15, 254, 255, 1022, 2046]
++    seq_lens_list = [
++        context + query for context, query in zip(context_lens, query_lens, strict=True)
++    ]
++    batch_size = len(query_lens)
++    max_blocks_per_seq = (max(seq_lens_list) + block_size - 1) // block_size
++    num_blocks = batch_size * max_blocks_per_seq
++
++    query_start_list = [0]
++    for query_len in query_lens:
++        query_start_list.append(query_start_list[-1] + query_len)
++    query_start = torch.tensor(query_start_list, dtype=torch.int32)
++    query = torch.randn(
++        query_start_list[-1],
++        num_query_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    key = torch.randn(
++        num_blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(num_blocks, dtype=torch.int32).view(
++        batch_size, max_blocks_per_seq
++    )
++    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
++    scratch_tokens = seq_threshold_3d * 3
++    scratch_output = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        dtype=torch.float32,
++    )
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def run(
++        run_query: torch.Tensor,
++        run_query_start: torch.Tensor,
++        run_seq_lens: torch.Tensor,
++        run_block_table: torch.Tensor,
++        run_max_query_len: int,
++    ) -> torch.Tensor:
++        output = torch.empty_like(run_query)
++        descale_shape = (len(run_seq_lens), num_kv_heads)
++        unified_attention(
++            q=run_query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=run_query_start,
++            max_seqlen_q=run_max_query_len,
++            seqused_k=run_seq_lens,
++            max_seqlen_k=int(run_seq_lens.max()),
++            softmax_scale=head_size**-0.5,
++            causal=True,
++            window_size=(sliding_window - 1, 0),
++            block_table=run_block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=torch.full(descale_shape, k_scale.item(), dtype=torch.float32),
++            v_descale=torch.full(descale_shape, v_scale.item(), dtype=torch.float32),
++            seq_threshold_3D=seq_threshold_3d,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(query, query_start, seq_lens, block_table, 3)
++    sequential_rows = []
++    for sequence, (context_len, query_len) in enumerate(
++        zip(context_lens, query_lens, strict=True)
++    ):
++        sequence_start = query_start_list[sequence]
++        for row in range(query_len):
++            sequential_rows.append(
++                run(
++                    query[sequence_start + row : sequence_start + row + 1],
++                    torch.tensor([0, 1], dtype=torch.int32),
++                    torch.tensor([context_len + row + 1], dtype=torch.int32),
++                    block_table[sequence : sequence + 1],
++                    1,
++                )
++            )
++    sequential_output = torch.cat(sequential_rows)
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@torch.inference_mode()
++def test_triton_small_m_3d_cuda_graph_matches_eager() -> None:
++    """The bounded q=3 segment buffers and launch geometry are graph-stable."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    query_len = 3
++    context_len = 254
++    seq_len = context_len + query_len
++    block_size = 16
++    head_size = 256
++    num_query_heads = 32
++    num_kv_heads = 16
++    num_segments = 16
++    blocks = (seq_len + block_size - 1) // block_size
++    query = torch.randn(query_len, num_query_heads, head_size, dtype=torch.bfloat16)
++    key = torch.randn(
++        blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(blocks, dtype=torch.int32).unsqueeze(0)
++    query_start = torch.tensor([0, query_len], dtype=torch.int32)
++    seq_lens = torch.tensor([seq_len], dtype=torch.int32)
++    k_descale = torch.full((1, num_kv_heads), k_scale.item())
++    v_descale = torch.full((1, num_kv_heads), v_scale.item())
++    scratch_output = torch.empty(
++        8 * 3,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(8 * 3, num_query_heads, num_segments, dtype=torch.float32)
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def launch(output: torch.Tensor) -> None:
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=query_start,
++            max_seqlen_q=query_len,
++            seqused_k=seq_lens,
++            max_seqlen_k=seq_len,
++            softmax_scale=head_size**-0.5,
++            causal=True,
++            window_size=(1023, 0),
++            block_table=block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=k_descale,
++            v_descale=v_descale,
++            seq_threshold_3D=8,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++
++    eager_output = torch.empty_like(query)
++    launch(eager_output)
++    torch.cuda.synchronize()
++    graph_output = torch.empty_like(query)
++    launch(graph_output)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        launch(graph_output)
++    graph.replay()
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
++
++
+ @pytest.mark.parametrize(
+     "seq_lens",
+     [
+diff --git a/tests/model_executor/layers/test_attention.py b/tests/model_executor/layers/test_attention.py
+new file mode 100644
+index 000000000..ba8855400
+--- /dev/null
++++ b/tests/model_executor/layers/test_attention.py
+@@ -0,0 +1,23 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.model_executor.layers.attention.attention import _should_use_mm_prefix
++
++
++@pytest.mark.parametrize(
++    ("is_mm_prefix_lm", "language_model_only", "expected"),
++    [(False, False, False), (True, False, True), (True, True, False)],
++)
++def test_language_only_model_does_not_require_mm_prefix_backend(
++    is_mm_prefix_lm: bool, language_model_only: bool, expected: bool
++) -> None:
++    model_config = SimpleNamespace(
++        is_mm_prefix_lm=is_mm_prefix_lm,
++        multimodal_config=SimpleNamespace(language_model_only=language_model_only),
++    )
++
++    assert _should_use_mm_prefix(model_config) is expected
+diff --git a/tests/quantization/test_kv_cache_scale_contract.py b/tests/quantization/test_kv_cache_scale_contract.py
+new file mode 100644
+index 000000000..ecdf26faf
+--- /dev/null
++++ b/tests/quantization/test_kv_cache_scale_contract.py
+@@ -0,0 +1,53 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.model_executor.layers.attention.attention import set_default_quant_scales
++from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
++
++
++def make_layer(*, quantized_query: bool) -> torch.nn.Module:
++    layer = torch.nn.Module()
++    set_default_quant_scales(layer, register_buffer=True)
++    layer.kv_cache_dtype = "fp8"
++    layer.calculate_kv_scales = False
++    layer.query_quant = object() if quantized_query else None
++    layer.impl = SimpleNamespace(supports_quant_query_input=quantized_query)
++    method = BaseKVCacheMethod(quant_config=None)
++    method.create_weights(layer)
++    layer.k_scale.weight_loader(layer.k_scale, torch.tensor(0.0035))
++    layer.v_scale.weight_loader(layer.v_scale, torch.tensor(0.0356))
++    return layer
++
++
++@pytest.mark.parametrize("quantized_query", [False, True])
++def test_missing_q_and_prob_scales_do_not_inherit_kv_scales(
++    quantized_query: bool,
++) -> None:
++    layer = make_layer(quantized_query=quantized_query)
++
++    BaseKVCacheMethod(quant_config=None).process_weights_after_loading(layer)
++
++    assert layer._k_scale_float == pytest.approx(0.0035)
++    assert layer._v_scale_float == pytest.approx(0.0356)
++    assert layer._q_scale_float == 1.0
++    assert layer._prob_scale_float == 1.0
++    assert layer._q_scale.item() == 1.0
++    assert layer._prob_scale.item() == 1.0
++
++
++def test_checkpoint_q_and_prob_scales_remain_independent() -> None:
++    layer = make_layer(quantized_query=True)
++    layer.q_scale.weight_loader(layer.q_scale, torch.tensor(0.125))
++    layer.prob_scale.weight_loader(layer.prob_scale, torch.tensor(0.25))
++
++    BaseKVCacheMethod(quant_config=None).process_weights_after_loading(layer)
++
++    assert layer._q_scale_float == pytest.approx(0.125)
++    assert layer._prob_scale_float == pytest.approx(0.25)
++    assert layer._q_scale.item() == pytest.approx(0.125)
++    assert layer._prob_scale.item() == pytest.approx(0.25)
+diff --git a/tests/v1/core/test_kv_admission.py b/tests/v1/core/test_kv_admission.py
+new file mode 100644
+index 000000000..11207643e
+--- /dev/null
++++ b/tests/v1/core/test_kv_admission.py
+@@ -0,0 +1,456 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++
++from vllm.v1.core.kv_admission import (
++    HybridKVAdmissionLedger,
++    get_request_admission_length,
++    validate_hybrid_kv_admission,
++)
++from vllm.v1.core.speculative_admission import (
++    SpeculativeAdmissionOverlay,
++    select_graph_aware_speculative_depth,
++    speculative_depth_fallbacks,
++    validate_hybrid_mtp_admission,
++)
++
++
++def test_hybrid_admission_bound_covers_real_cache_allocation():
++    """Exercise the port against real 0.31 managers, not just ledger arithmetic."""
++    import torch
++
++    from vllm.sampling_params import SamplingParams
++    from vllm.v1.core.kv_cache_manager import KVCacheManager
++    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
++    from vllm.v1.kv_cache_interface import (
++        FullAttentionSpec,
++        KVCacheConfig,
++        KVCacheGroupSpec,
++        SlidingWindowSpec,
++    )
++    from vllm.v1.request import Request
++
++    register_all_kvcache_specs(None)
++    common = dict(block_size=16, num_kv_heads=1, head_size=16, dtype=torch.float16)
++    config = KVCacheConfig(
++        num_blocks=128,
++        kv_cache_tensors=[],
++        kv_cache_groups=[
++            KVCacheGroupSpec(["full"], FullAttentionSpec(**common)),
++            KVCacheGroupSpec(
++                ["sliding"], SlidingWindowSpec(**common, sliding_window=32)
++            ),
++        ],
++    )
++    manager = KVCacheManager(
++        config,
++        max_model_len=128,
++        scheduler_block_size=16,
++        hash_block_size=16,
++        max_in_flight_tokens=0,
++        enable_caching=False,
++    )
++    assert manager.get_admission_blocks(128) == 11  # 8 full + 3 sliding
++    request = Request(
++        "probe", [1] * 31, SamplingParams(max_tokens=32), pooling_params=None
++    )
++    physical, upper = manager.prepare_speculative_allocation(request, 31, 4)
++    assert physical == 0
++    assert manager.allocate_slots(request, 31, num_lookahead_tokens=4) is not None
++    actual = sum(len(ids) for ids in manager.get_unique_physical_block_ids("probe"))
++    assert 0 < actual <= upper
++    manager.free(request)
++
++
++def reserve(
++    ledger: HybridKVAdmissionLedger,
++    batch_id: int,
++    request_id: str,
++    persistent: int,
++    physical: int,
++    upper: int,
++):
++    reservation = ledger.try_reserve(
++        batch_id=batch_id,
++        request_id=request_id,
++        persistent_blocks=persistent,
++        physical_blocks=physical,
++        physical_upper_bound=upper,
++    )
++    assert reservation is not None
++    return reservation
++
++
++def test_admission_reserves_declared_request_extent():
++    assert (
++        get_request_admission_length(
++            prompt_tokens=669, max_tokens=2048, max_model_len=6144
++        )
++        == 2717
++    )
++    assert (
++        get_request_admission_length(
++            prompt_tokens=4096, max_tokens=4096, max_model_len=6144
++        )
++        == 6144
++    )
++
++
++@pytest.mark.parametrize("accepted", [0, 1, 2])
++def test_q3_settlement_retains_rejected_physical_tail(accepted: int):
++    ledger = HybridKVAdmissionLedger(32, 2)
++    reservation = reserve(ledger, 1, "r", 10, 10, 12)
++    ledger.commit_allocation(reservation, 12)
++
++    # Rejection changes logical persistence, not the already allocated page.
++    persistent_after_acceptance = 10 + int(accepted == 2)
++    ledger.settle_batch(
++        1,
++        physical_blocks={"r": 12},
++        persistent_blocks={"r": persistent_after_acceptance},
++    )
++
++    assert ledger.physical["r"] == 12
++    assert ledger.charged_blocks == 12
++    assert ledger.stranded_blocks == 12 - persistent_after_acceptance
++
++
++def test_retained_tail_is_reused_and_then_promoted():
++    ledger = HybridKVAdmissionLedger(32, 2)
++    first = reserve(ledger, 1, "r", 10, 10, 12)
++    ledger.commit_allocation(first, 12)
++    ledger.settle_batch(1, {"r": 12}, {"r": 10})
++
++    second = reserve(ledger, 2, "r", 10, 12, 12)
++    ledger.commit_allocation(second, 12)
++    ledger.settle_batch(2, {"r": 12}, {"r": 12})
++    assert ledger.charged_blocks == 12
++    assert ledger.stranded_blocks == 0
++
++
++def test_full_and_swa_page_crossings_are_one_atomic_bound():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    # The upper bound represents one full-attention and five SWA crossings.
++    reservation = reserve(ledger, 1, "r", 12, 12, 18)
++    assert ledger.provisional_blocks == 6
++    ledger.commit_allocation(reservation, 18)
++    assert ledger.physical_blocks == 18
++    assert ledger.charged_blocks == 18
++
++
++def test_two_in_flight_batches_charge_union_physical_peak_once():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    first = reserve(ledger, 1, "r", 10, 10, 12)
++    ledger.commit_allocation(first, 12)
++    second = reserve(ledger, 2, "r", 10, 12, 13)
++    ledger.commit_allocation(second, 13)
++
++    assert ledger.charged_blocks == 13
++    assert ledger.physical_blocks == 13
++    ledger.settle_batch(1, {"r": 13}, {"r": 10})
++    assert ledger.charged_blocks == 13
++    ledger.settle_batch(2, {"r": 13}, {"r": 10})
++    assert ledger.stranded_blocks == 3
++
++
++def test_two_in_flight_batches_record_independent_depth_contracts():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    first = overlay.try_reserve(
++        batch_id=1,
++        request_id="r1",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=12,
++        selected_k=4,
++        lookahead_tokens=4,
++        completion_epoch=1,
++    )
++    second = overlay.try_reserve(
++        batch_id=2,
++        request_id="r2",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=12,
++        selected_k=2,
++        lookahead_tokens=2,
++        completion_epoch=2,
++    )
++    assert first is not None and second is not None
++    assert overlay.batch_contract(1).selected_k == 4
++    assert overlay.batch_contract(2).selected_k == 2
++    assert overlay.batch_contract(1).request_ids == ("r1",)
++    assert overlay.batch_contract(2).completion_epoch == 2
++
++
++def test_one_batch_rejects_mixed_depth_or_epoch():
++    ledger = HybridKVAdmissionLedger(30, 2)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    first = overlay.try_reserve(
++        batch_id=1,
++        request_id="r1",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=10,
++        selected_k=3,
++        lookahead_tokens=3,
++        completion_epoch=1,
++    )
++    assert first is not None
++    with pytest.raises(ValueError, match="inconsistent contract"):
++        overlay.try_reserve(
++            batch_id=1,
++            request_id="r2",
++            persistent_blocks=10,
++            physical_blocks=10,
++            physical_upper_bound=10,
++            selected_k=2,
++            lookahead_tokens=2,
++            completion_epoch=1,
++        )
++
++
++def test_atomic_reservation_failure_and_rollback():
++    ledger = HybridKVAdmissionLedger(12, 2)
++    assert (
++        ledger.try_reserve(
++            batch_id=1,
++            request_id="r",
++            persistent_blocks=10,
++            physical_blocks=10,
++            physical_upper_bound=13,
++        )
++        is None
++    )
++    assert ledger.charged_blocks == 0
++
++    reservation = reserve(ledger, 1, "r", 10, 10, 12)
++    ledger.rollback(reservation)
++    assert ledger.charged_blocks == 0
++    assert not ledger.batches
++
++
++def test_allocation_must_not_exceed_reserved_bound():
++    ledger = HybridKVAdmissionLedger(20, 2)
++    reservation = reserve(ledger, 1, "r", 10, 10, 12)
++    with pytest.raises(RuntimeError, match="exceeded bound"):
++        ledger.commit_allocation(reservation, 13)
++
++
++@pytest.mark.parametrize("terminal_reason", ["cancellation", "abort", "failure"])
++def test_terminal_request_retires_until_every_gpu_output_epoch(terminal_reason: str):
++    del terminal_reason  # The ledger intentionally treats every terminal path alike.
++    ledger = HybridKVAdmissionLedger(30, 2)
++    first = reserve(ledger, 1, "r", 10, 10, 12)
++    ledger.commit_allocation(first, 12)
++    second = reserve(ledger, 2, "r", 10, 12, 13)
++    ledger.commit_allocation(second, 13)
++
++    ledger.finish_request("r", physical_blocks=13)
++    assert ledger.retired_blocks == 13
++    assert ledger.free_blocks == 17
++    ledger.settle_batch(1, {}, {})
++    assert ledger.retired_blocks == 13
++    ledger.settle_batch(2, {}, {})
++    assert ledger.retired_blocks == 0
++    assert ledger.free_blocks == 30
++
++
++def test_normal_finish_releases_without_active_batch():
++    ledger = HybridKVAdmissionLedger(20, 1)
++    reservation = reserve(ledger, 1, "r", 10, 10, 10)
++    ledger.commit_allocation(reservation, 10)
++    ledger.settle_batch(1, {"r": 10}, {"r": 10})
++    ledger.finish_request("r", physical_blocks=10)
++    assert ledger.free_blocks == 20
++
++
++def test_duplicate_or_stale_batch_settlement_fails_closed():
++    ledger = HybridKVAdmissionLedger(20, 1)
++    reservation = reserve(ledger, 1, "r", 10, 10, 10)
++    ledger.commit_allocation(reservation, 10)
++    ledger.settle_batch(1, {"r": 10}, {"r": 10})
++    with pytest.raises(KeyError):
++        ledger.settle_batch(1, {"r": 10}, {"r": 10})
++
++
++def test_stale_completion_epoch_fails_before_settlement():
++    ledger = HybridKVAdmissionLedger(20, 1)
++    overlay = SpeculativeAdmissionOverlay(ledger)
++    reservation = overlay.try_reserve(
++        batch_id=4,
++        request_id="r",
++        persistent_blocks=10,
++        physical_blocks=10,
++        physical_upper_bound=10,
++        selected_k=3,
++        lookahead_tokens=3,
++        completion_epoch=9,
++    )
++    assert reservation is not None
++    with pytest.raises(ValueError, match="stale completion epoch"):
++        overlay.settle_batch(
++            4,
++            {"r": 10},
++            {"r": 10},
++            completion_epoch=8,
++        )
++    assert overlay.batch_contract(4).completion_epoch == 9
++
++
++def test_batch_settlement_validation_is_atomic():
++    ledger = HybridKVAdmissionLedger(30, 1)
++    first = reserve(ledger, 1, "r1", 10, 0, 10)
++    second = reserve(ledger, 1, "r2", 10, 0, 10)
++    ledger.commit_allocation(first, 10)
++    ledger.commit_allocation(second, 10)
++
++    before = (dict(ledger.persistent), dict(ledger.physical), dict(ledger.batches))
++    with pytest.raises(ValueError, match="r2"):
++        ledger.settle_batch(1, {"r1": 9}, {"r1": 10})
++
++    assert dict(ledger.persistent) == before[0]
++    assert dict(ledger.physical) == before[1]
++    assert dict(ledger.batches) == before[2]
++
++
++def test_batch_limit_fails_closed():
++    ledger = HybridKVAdmissionLedger(20, 1)
++    reserve(ledger, 1, "r1", 5, 0, 5)
++    assert (
++        ledger.try_reserve(
++            batch_id=2,
++            request_id="r2",
++            persistent_blocks=5,
++            physical_blocks=0,
++            physical_upper_bound=5,
++        )
++        is None
++    )
++
++
++def valid_mtp_config() -> dict[str, object]:
++    return {
++        "speculative_method": "mtp",
++        "num_spec_tokens": 2,
++        "use_eagle": True,
++        "num_lookahead_tokens": 2,
++        "dynamic_speculation": False,
++        "model_type": "gemma4_text",
++        "architectures": ("Gemma4ForConditionalGeneration",),
++    }
++
++
++def test_target_only_hybrid_cache_admission_is_supported():
++    validate_hybrid_kv_admission(
++        has_connector=False,
++        is_encoder_decoder=False,
++        has_mamba_layers=False,
++        prefix_caching=False,
++        cache_groups_supported=True,
++        max_concurrent_batches=2,
++    )
++
++
++@pytest.mark.parametrize(
++    ("field", "value", "message"),
++    [
++        ("has_connector", True, "connectors"),
++        ("is_encoder_decoder", True, "decoder-only"),
++        ("has_mamba_layers", True, "decoder-only"),
++        ("prefix_caching", True, "prefix caching"),
++        ("cache_groups_supported", False, "SWA/full-attention"),
++        ("max_concurrent_batches", 3, "at most two"),
++    ],
++)
++def test_unsupported_hybrid_cache_configurations_fail_closed(
++    field: str, value: object, message: str
++):
++    config = {
++        "has_connector": False,
++        "is_encoder_decoder": False,
++        "has_mamba_layers": False,
++        "prefix_caching": False,
++        "cache_groups_supported": True,
++        "max_concurrent_batches": 2,
++    }
++    config[field] = value
++    with pytest.raises(ValueError, match=message):
++        validate_hybrid_kv_admission(**config)
++
++
++@pytest.mark.parametrize("num_spec_tokens", [1, 2, 4, 8])
++def test_fixed_mtp_depth_is_supported(num_spec_tokens: int):
++    config = valid_mtp_config()
++    config["num_spec_tokens"] = num_spec_tokens
++    config["num_lookahead_tokens"] = num_spec_tokens
++    validate_hybrid_mtp_admission(**config)
++
++
++def test_bounded_dynamic_mtp_depths_are_supported():
++    config = valid_mtp_config()
++    config.update(
++        num_spec_tokens=4,
++        num_lookahead_tokens=4,
++        dynamic_speculation=True,
++        dynamic_speculative_depths=(4, 3, 2),
++    )
++    validate_hybrid_mtp_admission(**config)
++
++
++@pytest.mark.parametrize(
++    ("batch_size", "expected"),
++    [(1, (4, 1)), (12, (4, 12)), (16, (3, 16)), (24, (2, 21))],
++)
++def test_graph_aware_depth_and_membership_bound(
++    batch_size: int, expected: tuple[int, int]
++):
++    lookup = [0] + [4] * 12 + [3] * 4 + [2] * 16
++    assert (
++        select_graph_aware_speculative_depth(
++            candidate_count=batch_size,
++            depth_lookup=lookup,
++            max_graph_tokens=64,
++        )
++        == expected
++    )
++
++
++def test_depth_fallback_order_ends_target_only():
++    assert speculative_depth_fallbacks(4) == (4, 3, 2, 0)
++    assert speculative_depth_fallbacks(3) == (3, 2, 0)
++    assert speculative_depth_fallbacks(2) == (2, 0)
++
++
++@pytest.mark.parametrize("depths", [(1, 2, 3), (2, 4, 8), (), (0, 2, 4)])
++def test_unbounded_dynamic_mtp_depths_fail_closed(depths: tuple[int, ...]):
++    config = valid_mtp_config()
++    config.update(
++        num_spec_tokens=4,
++        num_lookahead_tokens=4,
++        dynamic_speculation=True,
++        dynamic_speculative_depths=depths,
++    )
++    with pytest.raises(ValueError, match="bounded k=2/3/4"):
++        validate_hybrid_mtp_admission(**config)
++
++
++@pytest.mark.parametrize(
++    ("field", "value", "message"),
++    [
++        ("speculative_method", "draft_model", "built-in MTP"),
++        ("num_spec_tokens", 0, "bounded speculation"),
++        ("use_eagle", False, "built-in MTP"),
++        ("num_lookahead_tokens", 3, "matching maximum lookahead"),
++        ("model_type", "llama", "Gemma 4"),
++        ("architectures", ("Gemma4TextModel",), "Gemma 4"),
++    ],
++)
++def test_unsupported_speculative_configurations_fail_closed(
++    field: str, value: object, message: str
++):
++    config = valid_mtp_config()
++    config[field] = value
++    with pytest.raises(ValueError, match=message):
++        validate_hybrid_mtp_admission(**config)
+diff --git a/tests/v1/core/test_kv_cache_utils.py b/tests/v1/core/test_kv_cache_utils.py
+index 7923e34d0..d1f89ff3d 100644
+--- a/tests/v1/core/test_kv_cache_utils.py
++++ b/tests/v1/core/test_kv_cache_utils.py
+@@ -4848,3 +4848,37 @@ def test_kv_cache_groups_tp_replicas(specs, tp_size, dcp_size, expected):
+     """Replicas are the gcd of each layer's tp_size // max_tp_shards."""
+     groups = [KVCacheGroupSpec([f"l.{i}"], spec) for i, spec in enumerate(specs)]
+     assert kv_cache_groups_tp_replicas(groups, tp_size, dcp_size) == expected
++def test_global_hybrid_admission_replaces_per_group_transient_reserve():
++    model_config = SimpleNamespace(max_model_len=6144)
++    vllm_config = SimpleNamespace(
++        model_config=model_config,
++        scheduler_config=SimpleNamespace(
++            hybrid_kv_cache_admission=False,
++            hybrid_kv_speculative_admission=False,
++        ),
++        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
++        max_in_flight_tokens=1024,
++    )
++    spec = SlidingWindowSpec(
++        block_size=16,
++        num_kv_heads=16,
++        head_size=256,
++        dtype=torch.float8_e4m3fn,
++        sliding_window=1024,
++    )
++
++    default_blocks = spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
++    assert default_blocks == spec.max_admission_blocks_per_request(
++        vllm_config.max_in_flight_tokens,
++        model_config.max_model_len,
++    )
++
++    vllm_config.scheduler_config.hybrid_kv_cache_admission = True
++    global_admission_blocks = (
++        spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
++    )
++    assert global_admission_blocks == spec.max_admission_blocks_per_request(
++        0,
++        model_config.max_model_len,
++    )
++    assert global_admission_blocks < default_blocks
+diff --git a/tests/v1/spec_decode/test_dynamic_sd_cug.py b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+index 392135f7b..1638bc970 100644
+--- a/tests/v1/spec_decode/test_dynamic_sd_cug.py
++++ b/tests/v1/spec_decode/test_dynamic_sd_cug.py
+@@ -426,3 +426,34 @@ def test_dynamic_sd_only_captures_scheduled_query_lengths(monkeypatch):
+                 assert desc.num_tokens == num_tokens
+                 assert desc.num_reqs is None
+             assert desc.num_active_loras == 0
++
++
++@pytest.fixture(autouse=True)
++def _cpu_graph_pool(monkeypatch):
++    monkeypatch.setattr(
++        gpu_cudagraph_utils.current_platform,
++        "get_global_graph_pool",
++        lambda: None,
++    )
++
++
++def test_dynamic_sd_does_not_change_autoregressive_draft_q1_candidates(monkeypatch):
++    monkeypatch.setattr(
++        gpu_cudagraph_utils,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    vllm_config = _create_vllm_config_for_dsd(
++        max_num_seqs=16,
++        max_spec_tokens=4,
++        num_spec_per_batch_size=[(1, 12, 4), (13, 16, 3)],
++    )
++    manager = gpu_cudagraph_utils.CudaGraphManager(
++        vllm_config=vllm_config,
++        device=torch.device("cpu"),
++        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
++        decode_query_len=1,
++    )
++    full_descs = manager._capture_descs[CUDAGraphMode.FULL]
++    assert full_descs
++    assert {desc.uniform_token_count for desc in full_descs} == {1}
+diff --git a/tests/v1/worker/test_shared_kv_scale_binding.py b/tests/v1/worker/test_shared_kv_scale_binding.py
+new file mode 100644
+index 000000000..09aed69ab
+--- /dev/null
++++ b/tests/v1/worker/test_shared_kv_scale_binding.py
+@@ -0,0 +1,243 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.v1.attention.backend import (
++    resolve_kv_scale_owner,
++    sync_kv_scale_consumers,
++)
++from vllm.v1.worker import utils as worker_utils
++from vllm.v1.worker.utils import bind_kv_cache
++
++
++class _AttentionStub(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.register_buffer("_q_scale", torch.ones(1))
++        self.register_buffer("_k_scale", torch.ones(1))
++        self.register_buffer("_v_scale", torch.ones(1))
++        self.register_buffer("_k_scale_cpu", torch.ones(1))
++        self.register_buffer("_v_scale_cpu", torch.ones(1))
++        self._k_scale_float = 1.0
++        self._v_scale_float = 1.0
++        self.kv_cache_dtype = "auto"
++        self.kv_sharing_target_layer_name = None
++        self.calculate_kv_scales = False
++
++    def bind_kv_cache(self, cache):
++        self.kv_cache = cache
++
++
++@pytest.fixture(autouse=True)
++def _cpu_platform(monkeypatch):
++    monkeypatch.setattr(worker_utils.current_platform, "is_cpu", lambda: True)
++    monkeypatch.setattr(
++        worker_utils.current_platform,
++        "check_runner_kv_caches_multi_layer",
++        lambda: None,
++    )
++
++
++def test_bind_kv_cache():
++    ctx = {
++        "layers.0.self_attn": _AttentionStub(),
++        "layers.1.self_attn": _AttentionStub(),
++        "layers.2.self_attn": _AttentionStub(),
++        "layers.3.self_attn": _AttentionStub(),
++    }
++    kv_cache = {
++        "layers.0.self_attn": torch.zeros((1,)),
++        "layers.1.self_attn": torch.zeros((1,)),
++        "layers.2.self_attn": torch.zeros((1,)),
++        "layers.3.self_attn": torch.zeros((1,)),
++    }
++    runner_kv_caches: list[torch.Tensor] = []
++    bind_kv_cache(kv_cache, ctx, runner_kv_caches)
++    assert ctx["layers.0.self_attn"].kv_cache is kv_cache["layers.0.self_attn"]
++    assert ctx["layers.1.self_attn"].kv_cache is kv_cache["layers.1.self_attn"]
++    assert ctx["layers.2.self_attn"].kv_cache is kv_cache["layers.2.self_attn"]
++    assert ctx["layers.3.self_attn"].kv_cache is kv_cache["layers.3.self_attn"]
++
++    assert runner_kv_caches[0] is kv_cache["layers.0.self_attn"]
++    assert runner_kv_caches[1] is kv_cache["layers.1.self_attn"]
++    assert runner_kv_caches[2] is kv_cache["layers.2.self_attn"]
++    assert runner_kv_caches[3] is kv_cache["layers.3.self_attn"]
++
++
++def test_bind_kv_cache_non_attention():
++    # example from Jamba PP=2
++    ctx = {
++        "model.layers.20.attn": _AttentionStub(),
++        "model.layers.28.attn": _AttentionStub(),
++    }
++    kv_cache = {
++        "model.layers.20.attn": torch.zeros((1,)),
++        "model.layers.28.attn": torch.zeros((1,)),
++    }
++
++    runner_kv_caches: list[torch.Tensor] = []
++    bind_kv_cache(kv_cache, ctx, runner_kv_caches)
++
++    assert ctx["model.layers.20.attn"].kv_cache is kv_cache["model.layers.20.attn"]
++    assert ctx["model.layers.28.attn"].kv_cache is kv_cache["model.layers.28.attn"]
++
++    assert runner_kv_caches[0] is kv_cache["model.layers.20.attn"]
++    assert runner_kv_caches[1] is kv_cache["model.layers.28.attn"]
++
++
++def test_bind_kv_cache_draft_model():
++    layer_names = [
++        "model.layers.0.attn",
++        "model.layers.1.attn",
++        "draft_model.layers.0.attn",
++        "draft_model.layers.1.attn",
++    ]
++    ctx = {layer_name: _AttentionStub() for layer_name in layer_names}
++    kv_cache = {layer_name: torch.zeros((1,)) for layer_name in layer_names}
++    runner_kv_caches: list[torch.Tensor] = []
++    bind_kv_cache(kv_cache, ctx, runner_kv_caches)
++
++    assert ctx["model.layers.0.attn"].kv_cache is kv_cache["model.layers.0.attn"]
++    assert ctx["model.layers.1.attn"].kv_cache is kv_cache["model.layers.1.attn"]
++    assert (
++        ctx["draft_model.layers.0.attn"].kv_cache
++        is kv_cache["draft_model.layers.0.attn"]
++    )
++    assert (
++        ctx["draft_model.layers.1.attn"].kv_cache
++        is kv_cache["draft_model.layers.1.attn"]
++    )
++
++    # caches are ordered by layer_index, interleaving target and draft model
++    assert runner_kv_caches[0] is kv_cache["model.layers.0.attn"]
++    assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
++    assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
++    assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
++
++
++def _configure_fp8_scale_owner(owner, consumer, owner_name):
++    owner.kv_cache_dtype = "fp8"
++    consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    owner._k_scale.fill_(0.125)
++    owner._v_scale.fill_(0.375)
++    owner._k_scale_float = 0.125
++    owner._v_scale_float = 0.375
++    owner._k_scale_cpu.fill_(0.125)
++    owner._v_scale_cpu.fill_(0.375)
++
++
++@pytest.mark.parametrize("attention_kind", ["sliding", "full"])
++def test_bind_shared_fp8_kv_scale_owner(attention_kind):
++    from vllm.v1.attention.backends import flashinfer, triton_attn
++
++    owner_name = f"model.layers.58.{attention_kind}_attn"
++    consumer_name = f"draft_model.layers.0.{attention_kind}_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    _configure_fp8_scale_owner(owner, consumer, owner_name)
++    consumer._q_scale.fill_(0.75)
++    cache = torch.arange(16, dtype=torch.uint8)
++    cache_before = cache.clone()
++    kv_cache = {owner_name: cache, consumer_name: cache}
++
++    bind_kv_cache(kv_cache, {owner_name: owner, consumer_name: consumer}, [])
++
++    assert resolve_kv_scale_owner(consumer) is owner
++    assert triton_attn.resolve_kv_scale_owner(consumer) is owner
++    assert flashinfer.resolve_kv_scale_owner(consumer) is owner
++    assert consumer._k_scale.item() == pytest.approx(0.125)
++    assert consumer._v_scale.item() == pytest.approx(0.375)
++    assert consumer._k_scale_float == pytest.approx(0.125)
++    assert consumer._v_scale_float == pytest.approx(0.375)
++    assert consumer._k_scale_cpu.item() == pytest.approx(0.125)
++    assert consumer._v_scale_cpu.item() == pytest.approx(0.375)
++    assert consumer._q_scale.item() == pytest.approx(0.75)
++    assert torch.equal(cache, cache_before)
++
++
++def test_bind_shared_bf16_kv_has_no_scale_owner():
++    owner_name = "model.layers.59.self_attn"
++    consumer_name = "draft_model.layers.3.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = "auto"
++    consumer.kv_cache_dtype = "auto"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.bfloat16)
++
++    bind_kv_cache(
++        {owner_name: cache, consumer_name: cache},
++        {owner_name: owner, consumer_name: consumer},
++        [],
++    )
++
++    assert resolve_kv_scale_owner(consumer) is consumer
++    assert consumer._k_scale.item() == 1.0
++    assert consumer._v_scale.item() == 1.0
++
++
++def test_shared_fp8_kv_scale_owner_refreshes_after_loading():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.uint8)
++    bind_kv_cache(
++        {owner_name: cache, consumer_name: cache},
++        {owner_name: owner, consumer_name: consumer},
++        [],
++    )
++
++    owner._k_scale.fill_(0.0625)
++    owner._v_scale.fill_(0.5)
++    owner._k_scale_float = 0.0625
++    owner._v_scale_float = 0.5
++    owner._k_scale_cpu.fill_(0.0625)
++    owner._v_scale_cpu.fill_(0.5)
++    sync_kv_scale_consumers(owner)
++
++    assert consumer._k_scale.item() == pytest.approx(0.0625)
++    assert consumer._v_scale.item() == pytest.approx(0.5)
++    assert consumer._k_scale_float == pytest.approx(0.0625)
++    assert consumer._v_scale_float == pytest.approx(0.5)
++
++
++def test_bind_shared_kv_rejects_incompatible_quantization():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = "fp8"
++    consumer.kv_cache_dtype = "auto"
++    consumer.kv_sharing_target_layer_name = owner_name
++    cache = torch.zeros(16, dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="quantization mismatch"):
++        bind_kv_cache(
++            {owner_name: cache, consumer_name: cache},
++            {owner_name: owner, consumer_name: consumer},
++            [],
++        )
++
++
++def test_bind_shared_fp8_kv_rejects_scale_granularity():
++    owner_name = "model.layers.58.self_attn"
++    consumer_name = "draft_model.layers.0.self_attn"
++    owner = _AttentionStub()
++    consumer = _AttentionStub()
++    owner.kv_cache_dtype = consumer.kv_cache_dtype = "fp8"
++    consumer.kv_sharing_target_layer_name = owner_name
++    owner._buffers["_k_scale"] = torch.ones(16, dtype=torch.float32)
++    cache = torch.zeros(16, dtype=torch.uint8)
++
++    with pytest.raises(ValueError, match="scale shape mismatch"):
++        bind_kv_cache(
++            {owner_name: cache, consumer_name: cache},
++            {owner_name: owner, consumer_name: consumer},
++            [],
++        )
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 1fb94d3ef..b340caaf8 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -194,6 +194,14 @@ class SchedulerConfig:
+     checking the first chunk. Prevents over-admission and KV cache thrashing
+     with chunked prefill."""
+ 
++    hybrid_kv_cache_admission: bool = False
++    """Enable transactional global admission for hybrid attention caches.
++    Disabled by default and rejected outside validated cache topologies."""
++
++    hybrid_kv_speculative_admission: bool = False
++    """Extend hybrid KV admission to validated fixed-length speculation.
++    Requires ``hybrid_kv_cache_admission``."""
++
+     watermark: float = Field(default=0.0, ge=0.0, lt=1.0)
+     """Fraction of total KV cache blocks to keep free (the watermark) when
+     admitting waiting or preempted requests into the running queue. This headroom
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index d641b1fba..bfcd6e393 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -687,6 +687,10 @@ class EngineArgs:
+     disable_chunked_mm_input: bool = SchedulerConfig.disable_chunked_mm_input
+ 
+     scheduler_reserve_full_isl: bool = SchedulerConfig.scheduler_reserve_full_isl
++    hybrid_kv_cache_admission: bool = SchedulerConfig.hybrid_kv_cache_admission
++    hybrid_kv_speculative_admission: bool = (
++        SchedulerConfig.hybrid_kv_speculative_admission
++    )
+     prefill_schedule_interval: int = SchedulerConfig.prefill_schedule_interval
+ 
+     watermark: float = SchedulerConfig.watermark
+@@ -1726,6 +1730,14 @@ class EngineArgs:
+             "--scheduler-reserve-full-isl",
+             **scheduler_kwargs["scheduler_reserve_full_isl"],
+         )
++        scheduler_group.add_argument(
++            "--hybrid-kv-cache-admission",
++            **scheduler_kwargs["hybrid_kv_cache_admission"],
++        )
++        scheduler_group.add_argument(
++            "--hybrid-kv-speculative-admission",
++            **scheduler_kwargs["hybrid_kv_speculative_admission"],
++        )
+         scheduler_group.add_argument("--watermark", **scheduler_kwargs["watermark"])
+         scheduler_group.add_argument(
+             "--prefill-schedule-interval",
+@@ -2567,6 +2579,8 @@ class EngineArgs:
+                 self.long_prefill_token_threshold_adaptive
+             ),
+             scheduler_reserve_full_isl=self.scheduler_reserve_full_isl,
++            hybrid_kv_cache_admission=self.hybrid_kv_cache_admission,
++            hybrid_kv_speculative_admission=self.hybrid_kv_speculative_admission,
+             watermark=self.watermark,
+             prefill_schedule_interval=self.prefill_schedule_interval,
+             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index bec1856d9..49d07cad4 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -42,6 +42,9 @@ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionMetadata,
+     AttentionType,
++    resolve_kv_scale_owner,
++    sync_kv_scale_consumer,
++    sync_kv_scale_consumers,
+ )
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.attention.selector import get_attn_backend
+@@ -58,6 +61,13 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++def _should_use_mm_prefix(model_config: Any) -> bool:
++    if model_config is None or not model_config.is_mm_prefix_lm:
++        return False
++    multimodal_config = model_config.multimodal_config
++    return multimodal_config is None or not multimodal_config.language_model_only
++
++
+ def validate_kv_sharing_target(
+     current_layer_name, target_layer_name, static_forward_context
+ ):
+@@ -341,7 +351,7 @@ class Attention(nn.Module, AttentionLayerBase):
+ 
+         # NOTE: model_config may be None during certain tests
+         model_config = vllm_config.model_config
+-        self.use_mm_prefix = model_config is not None and model_config.is_mm_prefix_lm
++        self.use_mm_prefix = _should_use_mm_prefix(model_config)
+ 
+         # During model initialization, the default dtype is set as the model
+         # weight and activation dtype.
+@@ -599,6 +609,11 @@ class Attention(nn.Module, AttentionLayerBase):
+         )
+         if not should_load_quant_weights(quant_method):
+             set_default_quant_scales(self, register_buffer=False)
++        owner = resolve_kv_scale_owner(self)
++        if owner is self:
++            sync_kv_scale_consumers(self)
++        else:
++            sync_kv_scale_consumer(self, owner)
+ 
+     def get_attn_backend(self) -> type[AttentionBackend]:
+         return self.attn_backend
+diff --git a/vllm/model_executor/layers/quantization/kv_cache.py b/vllm/model_executor/layers/quantization/kv_cache.py
+index 6d6a8c5ce..8ead785af 100644
+--- a/vllm/model_executor/layers/quantization/kv_cache.py
++++ b/vllm/model_executor/layers/quantization/kv_cache.py
+@@ -95,6 +95,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+             assert not hasattr(layer, "prob_scale")
+             return
+ 
++        q_scale_missing = bool((layer.q_scale < 0.0).item())
++
+         # Per-token-head quantized KV cache: scales are computed dynamically
+         # per (token, head) in the kernel at cache-write time.
+         if kv_cache_uses_per_token_head_scales(layer.kv_cache_dtype):
+@@ -142,15 +144,6 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+                     "Only support per-tensor scaling factor for fp8 KV cache"
+                 )
+ 
+-            if layer.q_scale < 0.0:
+-                logger.warning_once(
+-                    "Checkpoint does not provide a q scaling factor. "
+-                    "Setting it to k_scale. This only matters for "
+-                    "FP8 Attention backends (flash-attn or flashinfer)."
+-                )
+-                layer._q_scale.copy_(k_scale)
+-                layer._q_scale_float = k_scale
+-
+             # These are used in the final Attention.forward()
+             layer._k_scale.copy_(k_scale)
+             layer._v_scale.copy_(v_scale)
+@@ -197,12 +190,28 @@ class BaseKVCacheMethod(QuantizeMethodBase):
+         )
+ 
+         layer._prob_scale.copy_(prob_scale)
+-        if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
+-            logger.warning_once(
+-                f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
+-                f"{prob_scale} with fp8 attention. This may cause accuracy "
+-                "issues. Please make sure q/prob scaling factors are "
+-                "available in the fp8 checkpoint."
++        layer._prob_scale_float = (
++            prob_scale.item() if isinstance(prob_scale, torch.Tensor) else prob_scale
++        )
++
++        # Q and probability scales have different ownership and consumers from
++        # the persistent K/V-cache scales. In particular, an absent Q scale is
++        # not a request to reuse k_scale. The old fallback write was overwritten
++        # by the identity value below and its warning omitted Triton, which also
++        # supports pre-quantized queries. Report the actual selected contract,
++        # and only when this layer really has a quantized-query consumer.
++        query_quant = getattr(layer, "query_quant", None)
++        impl = getattr(layer, "impl", None)
++        if (
++            q_scale_missing
++            and query_quant is not None
++            and getattr(impl, "supports_quant_query_input", False)
++        ):
++            logger.info_once(
++                "Checkpoint does not provide an attention Q scale; %s uses "
++                "pre-quantized queries, so vLLM is using identity q_scale=1.0. "
++                "This is independent of the checkpoint's K/V-cache scales.",
++                type(impl).__name__,
+             )
+ 
+         del layer.k_scale
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index 319b9977f..c0217a04f 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -782,6 +782,50 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
+         return False
+ 
+ 
++def resolve_kv_scale_owner(layer: torch.nn.Module) -> torch.nn.Module:
++    """Return the attention layer that owns a shared KV cache's K/V scales."""
++    owner_ref = getattr(layer, "_kv_scale_owner_ref", None)
++    if owner_ref is None:
++        return layer
++    owner = owner_ref()
++    if owner is None:
++        raise RuntimeError("shared KV-cache scale owner was released")
++    return owner
++
++
++def sync_kv_scale_consumer(consumer: torch.nn.Module, owner: torch.nn.Module) -> None:
++    """Synchronize compatibility copies for backends reading consumer fields.
++
++    Triton and FlashInfer resolve the owner directly. Copies keep existing
++    backends correct for static scales and cover host/device cached fields.
++    """
++    for name in ("_k_scale", "_v_scale", "_k_scale_cpu", "_v_scale_cpu"):
++        destination = getattr(consumer, name)
++        source = getattr(owner, name)
++        if destination.shape != source.shape:
++            raise ValueError(
++                f"shared KV-cache scale shape mismatch for {name}: "
++                f"consumer={tuple(destination.shape)}, owner={tuple(source.shape)}"
++            )
++        destination.copy_(source)
++    consumer._k_scale_float = owner._k_scale_float
++    consumer._v_scale_float = owner._v_scale_float
++    consumer.calculate_kv_scales = False
++
++
++def sync_kv_scale_consumers(owner: torch.nn.Module) -> None:
++    """Refresh all live consumers after owner scales load or are calculated."""
++    consumer_refs = getattr(owner, "_kv_scale_consumer_refs", ())
++    live_refs = []
++    for consumer_ref in consumer_refs:
++        consumer = consumer_ref()
++        if consumer is not None:
++            sync_kv_scale_consumer(consumer, owner)
++            live_refs.append(consumer_ref)
++    if consumer_refs:
++        object.__setattr__(owner, "_kv_scale_consumer_refs", live_refs)
++
++
+ class AttentionLayer(Protocol):
+     _q_scale: torch.Tensor
+     _k_scale: torch.Tensor
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index ecc66a75c..a66a0c95c 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -71,6 +71,7 @@ from vllm.v1.attention.backend import (
+     CommonAttentionMetadata,
+     MultipleOf,
+     max_decode_query_len,
++    resolve_kv_scale_owner,
+ )
+ from vllm.v1.attention.backends.utils import (
+     get_dcp_local_seq_lens,
+@@ -368,8 +369,8 @@ class BatchDCPPrefillWrapper:
+         output_context_tmp, lse_context_tmp = self._context.run(
+             prefill_query_across_dcp,
+             kv_cache_tuple,
+-            k_scale=layer._k_scale_float,
+-            v_scale=layer._v_scale_float,
++            k_scale=resolve_kv_scale_owner(layer)._k_scale_float,
++            v_scale=resolve_kv_scale_owner(layer)._v_scale_float,
+             return_lse=True,
+         )
+         output_context, lse_context = self._dcp_combine(
+@@ -1982,7 +1983,7 @@ class FlashInferImpl(AttentionImpl):
+         if is_quantized_kv_cache(self.kv_cache_dtype):
+             if q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2):
+                 bmm1_scale *= layer._q_scale_float
+-            bmm1_scale *= layer._k_scale_float
++            bmm1_scale *= resolve_kv_scale_owner(layer)._k_scale_float
+         return bmm1_scale
+ 
+     # SM90 may need FP8-Q for native prefill and BF16/FP16-Q for XQA decode,
+@@ -2045,15 +2046,17 @@ class FlashInferImpl(AttentionImpl):
+             # Profiling run.
+             return output.fill_(0)
+ 
++        kv_scale_owner = resolve_kv_scale_owner(layer)
++
+         if self.bmm1_scale is None:
+             self.bmm1_scale = self.scale
+             if is_quantized_kv_cache(self.kv_cache_dtype):
+-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
++                self.bmm1_scale *= layer._q_scale_float * kv_scale_owner._k_scale_float
+ 
+         if self.bmm2_scale is None:
+             self.bmm2_scale = 1.0
+             if is_quantized_kv_cache(self.kv_cache_dtype):
+-                self.bmm2_scale *= layer._v_scale_float
++                self.bmm2_scale *= kv_scale_owner._v_scale_float
+ 
+         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
+         decode_kernel = (
+@@ -2281,8 +2284,10 @@ class FlashInferImpl(AttentionImpl):
+                             prefill_query,
+                             kv_cache_for_fi,
+                             self.sinks,
+-                            self.scale * layer._q_scale_float * layer._k_scale_float,
+-                            v_scale=layer._v_scale_float,
++                            self.scale
++                            * layer._q_scale_float
++                            * kv_scale_owner._k_scale_float,
++                            v_scale=kv_scale_owner._v_scale_float,
+                             out=out_prefill,
+                         )
+                     else:
+@@ -2290,8 +2295,8 @@ class FlashInferImpl(AttentionImpl):
+                             prefill_query,
+                             kv_cache_for_fi,
+                             q_scale=layer._q_scale_float,
+-                            k_scale=layer._k_scale_float,
+-                            v_scale=layer._v_scale_float,
++                            k_scale=kv_scale_owner._k_scale_float,
++                            v_scale=kv_scale_owner._v_scale_float,
+                             out=out_prefill,
+                             kv_cache_sf=kv_cache_sf,
+                         )
+@@ -2376,8 +2381,8 @@ class FlashInferImpl(AttentionImpl):
+                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
+                         kv_cache_5d,
+                         block_tables_prefill,
+-                        layer._k_scale,
+-                        layer._v_scale,
++                        kv_scale_owner._k_scale,
++                        kv_scale_owner._v_scale,
+                         attn_metadata.q_data_type_prefill,
+                     )
+                 else:
+@@ -2461,8 +2466,8 @@ class FlashInferImpl(AttentionImpl):
+                         decode_query,
+                         kv_cache_for_fi,
+                         q_scale=layer._q_scale_float,
+-                        k_scale=layer._k_scale_float,
+-                        v_scale=layer._v_scale_float,
++                        k_scale=kv_scale_owner._k_scale_float,
++                        v_scale=kv_scale_owner._v_scale_float,
+                         out=output_tmp,
+                         lse=lse,
+                         return_lse=True,
+@@ -2479,8 +2484,8 @@ class FlashInferImpl(AttentionImpl):
+                         decode_query,
+                         kv_cache_for_fi,
+                         q_scale=layer._q_scale_float,
+-                        k_scale=layer._k_scale_float,
+-                        v_scale=layer._v_scale_float,
++                        k_scale=kv_scale_owner._k_scale_float,
++                        v_scale=kv_scale_owner._v_scale_float,
+                         out=out_decode,
+                         kv_cache_sf=kv_cache_sf,
+                         sinks=self.sinks,
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 8a2fab4cc..836dc46bf 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -29,6 +29,7 @@ from vllm.v1.attention.backend import (
+     AttentionType,
+     CommonAttentionMetadata,
+     MultipleOf,
++    resolve_kv_scale_owner,
+ )
+ from vllm.v1.attention.backends.utils import (
+     compute_mm_prefix_range_tensor,
+@@ -39,7 +40,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+     triton_reshape_and_cache_flash,
+     triton_reshape_and_cache_flash_per_token_head_quant,
+ )
+-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++from vllm.v1.attention.ops.triton_unified_attention import (
++    MAX_SMALL_M_3D_QUERY_LEN,
++    unified_attention,
++)
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     KVQuantMode,
+@@ -153,9 +157,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+         headdim_padded = next_power_of_2(self.headdim)
++        max_3d_tokens = self.seq_threshold_3D * MAX_SMALL_M_3D_QUERY_LEN
+         self.softmax_segm_output = torch.empty(
+             (
+-                self.seq_threshold_3D,
++                max_3d_tokens,
+                 self.num_heads_q,
+                 self.num_par_softmax_segments,
+                 headdim_padded,
+@@ -164,12 +169,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             device=device,
+         )
+         self.softmax_segm_max = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (max_3d_tokens, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.softmax_segm_expsum = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (max_3d_tokens, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+@@ -641,8 +646,9 @@ class TritonAttentionImpl(AttentionImpl):
+                 )
+                 else None
+             )
+-            k_descale = layer._k_scale.expand(descale_shape)
+-            v_descale = layer._v_scale.expand(descale_shape)
++            kv_scale_owner = resolve_kv_scale_owner(layer)
++            k_descale = kv_scale_owner._k_scale.expand(descale_shape)
++            v_descale = kv_scale_owner._v_scale.expand(descale_shape)
+             k_scale_cache = None
+             v_scale_cache = None
+ 
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index b0231dd0c..641f8123a 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
+ logger = init_logger(__name__)
+ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+ float8_info = torch.finfo(current_platform.fp8_dtype())
++MAX_SMALL_M_3D_QUERY_LEN = 3
+ 
+ 
+ @triton.jit
+@@ -243,6 +244,7 @@ def kernel_unified_attention(
+     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
+     # per-segment partials, finalized by ``reduce_segments``.
+     IS_3D: tl.constexpr,
++    ROW_EQUIVALENT_3D: tl.constexpr,
+     # Parameters below default to None so Triton can skip materialising them
+     # on call sites where the corresponding constexpr branch is dead.
+     # Credit: @quinnlp identified this as a perf regression source in
+@@ -319,12 +321,32 @@ def kernel_unified_attention(
+     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+         return
+ 
++    context_len = seq_len - cur_batch_query_len
+     if IS_3D:
+-        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+-        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+-            return
++        if ROW_EQUIVALENT_3D:
++            q_block_first = q_block_local_idx * BLOCK_Q
++            q_block_last = tl.minimum(q_block_first + BLOCK_Q, cur_batch_query_len) - 1
++            first_row_seq_len = context_len + q_block_first + 1
++            last_row_seq_len = context_len + q_block_last + 1
++            min_tiles_per_segment = cdiv_fn(
++                first_row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            max_tiles_per_segment = cdiv_fn(
++                last_row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            tiles_per_segment = max_tiles_per_segment
++            if segm_idx * min_tiles_per_segment * TILE_SIZE >= last_row_seq_len:
++                return
++        else:
++            tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
++            min_tiles_per_segment = tiles_per_segment
++            max_tiles_per_segment = tiles_per_segment
++            if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
++                return
+     else:
+         tiles_per_segment = 0
++        min_tiles_per_segment = 0
++        max_tiles_per_segment = 0
+ 
+     # Number of valid query rows in this block (used by TD descriptor
+     # shapes, but always computed so the variable stays in scope).
+@@ -386,8 +408,6 @@ def kernel_unified_attention(
+         score_scale = scale * tl.load(q_scale) * tl.load(k_scale)
+         value_scale = tl.load(v_scale)
+ 
+-    context_len = seq_len - cur_batch_query_len
+-
+     if USE_ALIBI_SLOPES:
+         alibi_slope = tl.load(
+             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+@@ -409,7 +429,7 @@ def kernel_unified_attention(
+         num_queries_per_kv,
+         SLIDING_WINDOW,
+         USE_MM_PREFIX,
+-        IS_3D,
++        IS_3D and not ROW_EQUIVALENT_3D,
+         USE_CAUSAL,
+         USE_PER_SEQ_CAUSAL,
+         CHUNK_LOOKBACK,
+@@ -420,6 +440,9 @@ def kernel_unified_attention(
+         mm_prefix_range_ptr,
+         seq_idx,
+     )
++    if ROW_EQUIVALENT_3D:
++        loop_lo = tl.maximum(loop_lo, segm_idx * min_tiles_per_segment)
++        loop_hi = tl.minimum(loop_hi, (segm_idx + 1) * max_tiles_per_segment)
+ 
+     # iterate through tiles (now limited to the sliding window range)
+     for j in range(loop_lo, loop_hi):
+@@ -563,7 +586,48 @@ def kernel_unified_attention(
+                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+             )
+ 
++        M_prev = M
++        L_prev = L
+         M, L, P, alpha = softmax_step(S, M, L)
++        row_update_active = tl.full([BLOCK_M], True, dtype=tl.int1)
++        if ROW_EQUIVALENT_3D:
++            row_seq_len = context_len + query_pos + 1
++            row_tiles_per_segment = cdiv_fn(
++                row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            row_segment_start = segm_idx * row_tiles_per_segment
++            row_segment_end = (segm_idx + 1) * row_tiles_per_segment
++            row_update_active &= (
++                (j >= row_segment_start)
++                & (j < row_segment_end)
++                & (row_segment_start * TILE_SIZE < row_seq_len)
++            )
++        # The loop bounds cover the union of rows in a query block. Preserve
++        # each row's sequential SWA tile range for a single query block.
++        if (
++            SLIDING_WINDOW > 0
++            and not USE_MM_PREFIX
++            and not USE_R_SWA
++            and CHUNK_LOOKBACK < 0
++        ):
++            query_abs_pos_1d = context_len + query_pos
++            row_first_key = query_abs_pos_1d - SLIDING_WINDOW + 1
++            row_tile_start = tl.maximum(0, row_first_key // TILE_SIZE)
++            row_tile_end = query_abs_pos_1d // TILE_SIZE + 1
++            row_tile_active = (cur_batch_query_len > BLOCK_Q) | (
++                (j >= row_tile_start) & (j < row_tile_end)
++            )
++            row_update_active &= row_tile_active
++        if ROW_EQUIVALENT_3D or (
++            SLIDING_WINDOW > 0
++            and not USE_MM_PREFIX
++            and not USE_R_SWA
++            and CHUNK_LOOKBACK < 0
++        ):
++            M = tl.where(row_update_active, M, M_prev)
++            L = tl.where(row_update_active, L, L_prev)
++            P = tl.where(row_update_active[:, None], P, 0.0)
++            alpha = tl.where(row_update_active, alpha, 1.0)
+         acc = acc * alpha[:, None]
+ 
+         if SLIDING_WINDOW:
+@@ -707,6 +771,7 @@ def reduce_segments(
+     BLOCK_Q: tl.constexpr,  # int
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    ROW_EQUIVALENT_3D: tl.constexpr,
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -720,6 +785,13 @@ def reduce_segments(
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
+ 
++    if ROW_EQUIVALENT_3D:
++        query_start = tl.load(query_start_len_ptr + seq_idx)
++        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
++        query_len = query_end - query_start
++        query_pos = query_token_idx - query_start
++        seq_len = seq_len - query_len + query_pos + 1
++
+     # number of segments for this particular sequence
+     num_segments = NUM_SEGMENTS_PER_SEQ
+     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+@@ -1038,21 +1110,32 @@ def unified_attention(
+             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
+         )
+ 
+-    # Launch the 2D kernel if
+-    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+-    # 2. The batch includes at least one prefill request, or
+-    # 3. The number of sequences exceeds the configured threshold, or
+-    # 4. Batch invariance is enabled
++    # Use the segmented path only for bounded small-M requests whose rows fit
++    # in the fixed scratch buffers. Larger prefills retain the 2D path.
++    bounded_3d_query = max_seqlen_q <= MAX_SMALL_M_3D_QUERY_LEN
++    segment_capacity = (
++        min(
++            softmax_segm_output.shape[0],
++            softmax_segm_max.shape[0],
++            softmax_segm_expsum.shape[0],
++        )
++        if softmax_segm_output is not None
++        and softmax_segm_max is not None
++        and softmax_segm_expsum is not None
++        else 0
++    )
+     use_3d = not (
+         seq_threshold_3D is None
+         or num_par_softmax_segments is None
+         or softmax_segm_output is None
+         or softmax_segm_max is None
+         or softmax_segm_expsum is None
+-        or max_seqlen_q > 1
++        or not bounded_3d_query
++        or q.shape[0] > segment_capacity
+         or num_seqs > seq_threshold_3D
+         or is_batch_invariant
+     )
++    row_equivalent_3d = use_3d and max_seqlen_q > 1
+ 
+     # The kernel signature is the same for 2D and 3D — only the launch
+     # grid + a handful of constexpr toggles differ.  Per-token-head scale
+@@ -1161,6 +1244,7 @@ def unified_attention(
+         NUM_SEGMENTS_PER_SEQ=num_segments,
+         USE_FP8=output_scale is not None,
+         IS_3D=use_3d,
++        ROW_EQUIVALENT_3D=row_equivalent_3d,
+         KV_QUANT_MODE=kv_quant_mode,
+         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+         CHUNK_LOOKBACK=chunk_lookback,
+@@ -1191,4 +1275,5 @@ def unified_attention(
+             BLOCK_Q=BLOCK_Q,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+             USE_FP8=output_scale is not None,
++            ROW_EQUIVALENT_3D=row_equivalent_3d,
+         )
+diff --git a/vllm/v1/core/kv_admission.py b/vllm/v1/core/kv_admission.py
+new file mode 100644
+index 000000000..fd165c7a3
+--- /dev/null
++++ b/vllm/v1/core/kv_admission.py
+@@ -0,0 +1,409 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Transactional admission credits for hybrid KV allocation.
++
++The scheduler remains the sole owner of this ledger. The ledger does not own
++or trim cache blocks; it conservatively couples future persistent admission,
++live physical ownership, and every submitted-but-unsettled batch upper bound.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++
++
++def get_request_admission_length(
++    *, prompt_tokens: int, max_tokens: int, max_model_len: int
++) -> int:
++    """Return the declared request extent that must remain satisfiable."""
++    if prompt_tokens <= 0 or max_tokens <= 0 or max_model_len <= 0:
++        raise ValueError("admission lengths must be positive")
++    return min(prompt_tokens + max_tokens, max_model_len)
++
++
++def validate_hybrid_kv_admission(
++    *,
++    has_connector: bool,
++    is_encoder_decoder: bool,
++    has_mamba_layers: bool,
++    prefix_caching: bool,
++    cache_groups_supported: bool,
++    max_concurrent_batches: int,
++) -> None:
++    """Fail closed outside supported global hybrid-cache configurations."""
++    if has_connector:
++        raise ValueError("hybrid KV admission does not support connectors")
++    if is_encoder_decoder or has_mamba_layers:
++        raise ValueError("hybrid KV admission supports decoder-only attention caches")
++    if prefix_caching:
++        raise ValueError("hybrid KV admission requires prefix caching disabled")
++    if not cache_groups_supported:
++        raise ValueError("hybrid KV admission supports only SWA/full-attention groups")
++    if max_concurrent_batches > 2:
++        raise ValueError("hybrid KV admission supports at most two GPU batches")
++
++
++@dataclass(frozen=True)
++class AdmissionReservation:
++    batch_id: int
++    request_id: str
++    previous_persistent_blocks: int | None
++    previous_physical_blocks: int | None
++    previous_batch_upper_bound: int | None
++
++
++@dataclass
++class _BatchReservation:
++    physical_upper_bounds: dict[str, int] = field(default_factory=dict)
++
++
++@dataclass(frozen=True)
++class _RetiredReservation:
++    blocks: int
++    blocking_batches: frozenset[int]
++
++
++class HybridKVAdmissionLedger:
++    """Fail-closed credits over one global hybrid KV block pool.
++
++    For each active request the charged amount is::
++
++        max(persistent, live physical, every active batch upper bound)
++
++    Persistent capacity can therefore absorb bounded transient ownership that
++    is already physically inside the request's future reservation, while a
++    page crossing beyond that reservation remains charged exactly once.
++    """
++
++    def __init__(self, capacity_blocks: int, max_in_flight_batches: int) -> None:
++        if capacity_blocks <= 0:
++            raise ValueError("capacity_blocks must be positive")
++        if max_in_flight_batches <= 0:
++            raise ValueError("max_in_flight_batches must be positive")
++        self.capacity_blocks = capacity_blocks
++        self.max_in_flight_batches = max_in_flight_batches
++        self.persistent: dict[str, int] = {}
++        self.physical: dict[str, int] = {}
++        self.batches: dict[int, _BatchReservation] = {}
++        self.retired: dict[str, _RetiredReservation] = {}
++
++    @property
++    def persistent_blocks(self) -> int:
++        return sum(self.persistent.values())
++
++    @property
++    def physical_blocks(self) -> int:
++        return sum(self.physical.values())
++
++    @property
++    def provisional_blocks(self) -> int:
++        total = 0
++        for request_id in self._active_request_ids():
++            base = max(
++                self.persistent.get(request_id, 0),
++                self.physical.get(request_id, 0),
++            )
++            total += max(0, self._request_batch_bound(request_id) - base)
++        return total
++
++    @property
++    def stranded_blocks(self) -> int:
++        """Physical tail blocks beyond persistence with no active batch."""
++        active_batch_requests = {
++            request_id
++            for batch in self.batches.values()
++            for request_id in batch.physical_upper_bounds
++        }
++        return sum(
++            max(0, blocks - self.persistent.get(request_id, 0))
++            for request_id, blocks in self.physical.items()
++            if request_id not in active_batch_requests
++        )
++
++    @property
++    def retired_blocks(self) -> int:
++        return sum(item.blocks for item in self.retired.values())
++
++    @property
++    def charged_blocks(self) -> int:
++        active = sum(
++            max(
++                self.persistent.get(request_id, 0),
++                self.physical.get(request_id, 0),
++                self._request_batch_bound(request_id),
++            )
++            for request_id in self._active_request_ids()
++        )
++        return active + self.retired_blocks
++
++    @property
++    def free_blocks(self) -> int:
++        return self.capacity_blocks - self.charged_blocks
++
++    def batch_request_bounds(self, batch_id: int) -> dict[str, int]:
++        batch = self.batches.get(batch_id)
++        return dict(batch.physical_upper_bounds) if batch is not None else {}
++
++    def can_reserve(
++        self,
++        *,
++        batch_id: int,
++        request_id: str,
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++    ) -> bool:
++        return (
++            self._staged_charge(
++                batch_id=batch_id,
++                request_id=request_id,
++                persistent_blocks=persistent_blocks,
++                physical_blocks=physical_blocks,
++                physical_upper_bound=physical_upper_bound,
++            )
++            <= self.capacity_blocks
++        )
++
++    def try_reserve(
++        self,
++        *,
++        batch_id: int,
++        request_id: str,
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++    ) -> AdmissionReservation | None:
++        """Atomically reserve one request's exact allocation upper bound."""
++        self._validate_counts(persistent_blocks, physical_blocks, physical_upper_bound)
++        if request_id in self.retired:
++            raise ValueError(f"request {request_id!r} is retired")
++        batch = self.batches.get(batch_id)
++        if batch is None and len(self.batches) >= self.max_in_flight_batches:
++            return None
++        if batch is not None and request_id in batch.physical_upper_bounds:
++            raise ValueError(
++                f"request {request_id!r} already reserved in batch {batch_id}"
++            )
++        if not self.can_reserve(
++            batch_id=batch_id,
++            request_id=request_id,
++            persistent_blocks=persistent_blocks,
++            physical_blocks=physical_blocks,
++            physical_upper_bound=physical_upper_bound,
++        ):
++            return None
++
++        previous_persistent = self.persistent.get(request_id)
++        previous_physical = self.physical.get(request_id)
++        previous_batch_bound = (
++            batch.physical_upper_bounds.get(request_id) if batch else None
++        )
++        self.persistent[request_id] = max(persistent_blocks, previous_persistent or 0)
++        self.physical[request_id] = physical_blocks
++        if batch is None:
++            batch = self.batches.setdefault(batch_id, _BatchReservation())
++        batch.physical_upper_bounds[request_id] = physical_upper_bound
++        self._assert_invariants()
++        return AdmissionReservation(
++            batch_id=batch_id,
++            request_id=request_id,
++            previous_persistent_blocks=previous_persistent,
++            previous_physical_blocks=previous_physical,
++            previous_batch_upper_bound=previous_batch_bound,
++        )
++
++    def commit_allocation(
++        self, reservation: AdmissionReservation, physical_blocks: int
++    ) -> None:
++        """Bind a successful reservation to the observed physical result."""
++        if physical_blocks < 0:
++            raise ValueError("physical_blocks must be non-negative")
++        batch = self.batches.get(reservation.batch_id)
++        if batch is None or reservation.request_id not in batch.physical_upper_bounds:
++            raise KeyError((reservation.batch_id, reservation.request_id))
++        planned = batch.physical_upper_bounds[reservation.request_id]
++        if physical_blocks > planned:
++            raise RuntimeError(
++                f"physical allocation {physical_blocks} exceeded bound {planned}"
++            )
++        self.physical[reservation.request_id] = physical_blocks
++        batch.physical_upper_bounds[reservation.request_id] = physical_blocks
++        self._assert_invariants()
++
++    def rollback(self, reservation: AdmissionReservation) -> None:
++        """Roll back one reservation after allocation failed."""
++        batch = self.batches.get(reservation.batch_id)
++        if batch is None or reservation.request_id not in batch.physical_upper_bounds:
++            raise KeyError((reservation.batch_id, reservation.request_id))
++        if reservation.previous_batch_upper_bound is None:
++            del batch.physical_upper_bounds[reservation.request_id]
++        else:
++            batch.physical_upper_bounds[reservation.request_id] = (
++                reservation.previous_batch_upper_bound
++            )
++        if not batch.physical_upper_bounds:
++            del self.batches[reservation.batch_id]
++        self._restore(
++            self.persistent,
++            reservation.request_id,
++            reservation.previous_persistent_blocks,
++        )
++        self._restore(
++            self.physical,
++            reservation.request_id,
++            reservation.previous_physical_blocks,
++        )
++        self._assert_invariants()
++
++    def settle_batch(
++        self,
++        batch_id: int,
++        physical_blocks: dict[str, int],
++        persistent_blocks: dict[str, int],
++    ) -> None:
++        """Promote/roll back only after GPU output and rejection are resolved."""
++        batch = self.batches.get(batch_id)
++        if batch is None:
++            raise KeyError(batch_id)
++        active_request_ids = [
++            request_id
++            for request_id in batch.physical_upper_bounds
++            if request_id not in self.retired
++        ]
++        for request_id in active_request_ids:
++            if request_id not in physical_blocks or request_id not in persistent_blocks:
++                raise ValueError(f"missing settlement state for {request_id!r}")
++            physical = physical_blocks[request_id]
++            persistent = persistent_blocks[request_id]
++            if physical < 0 or persistent <= 0:
++                raise ValueError("invalid settlement block counts")
++
++        next_physical = dict(self.physical)
++        next_persistent = dict(self.persistent)
++        for request_id in active_request_ids:
++            next_physical[request_id] = physical_blocks[request_id]
++            next_persistent[request_id] = max(
++                next_persistent.get(request_id, 0),
++                persistent_blocks[request_id],
++            )
++
++        self.physical = next_physical
++        self.persistent = next_persistent
++        del self.batches[batch_id]
++        self._drain_retired()
++        self._assert_invariants()
++
++    def finish_request(self, request_id: str, physical_blocks: int) -> None:
++        """Release now or retire until all submitted batches have settled."""
++        if physical_blocks < 0:
++            raise ValueError("physical_blocks must be non-negative")
++        if request_id in self.retired:
++            raise ValueError(f"request {request_id!r} is already retired")
++        persistent = self.persistent.pop(request_id, 0)
++        recorded_physical = self.physical.pop(request_id, 0)
++        blockers = frozenset(
++            batch_id
++            for batch_id, batch in self.batches.items()
++            if request_id in batch.physical_upper_bounds
++        )
++        charged = max(
++            persistent,
++            physical_blocks,
++            recorded_physical,
++            self._request_batch_bound(request_id),
++        )
++        if charged and blockers:
++            self.retired[request_id] = _RetiredReservation(charged, blockers)
++        self._drain_retired()
++        self._assert_invariants()
++
++    def _staged_charge(
++        self,
++        *,
++        batch_id: int,
++        request_id: str,
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++    ) -> int:
++        self._validate_counts(persistent_blocks, physical_blocks, physical_upper_bound)
++        if request_id in self.retired:
++            return self.capacity_blocks + 1
++        batch = self.batches.get(batch_id)
++        if batch is None and len(self.batches) >= self.max_in_flight_batches:
++            return self.capacity_blocks + 1
++
++        active_ids = self._active_request_ids() | {request_id}
++        total = self.retired_blocks
++        for active_id in active_ids:
++            persistent = self.persistent.get(active_id, 0)
++            physical = self.physical.get(active_id, 0)
++            bound = self._request_batch_bound(active_id)
++            if active_id == request_id:
++                persistent = max(persistent, persistent_blocks)
++                physical = physical_blocks
++                bound = max(bound, physical_upper_bound)
++            total += max(persistent, physical, bound)
++        return total
++
++    def _active_request_ids(self) -> set[str]:
++        active = (
++            self.persistent.keys()
++            | self.physical.keys()
++            | {
++                request_id
++                for batch in self.batches.values()
++                for request_id in batch.physical_upper_bounds
++            }
++        )
++        return set(active).difference(self.retired)
++
++    def _request_batch_bound(self, request_id: str) -> int:
++        return max(
++            (
++                batch.physical_upper_bounds.get(request_id, 0)
++                for batch in self.batches.values()
++            ),
++            default=0,
++        )
++
++    def _drain_retired(self) -> None:
++        active_batches = self.batches.keys()
++        for request_id in [
++            request_id
++            for request_id, item in self.retired.items()
++            if item.blocking_batches.isdisjoint(active_batches)
++        ]:
++            del self.retired[request_id]
++
++    @staticmethod
++    def _validate_counts(
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++    ) -> None:
++        if persistent_blocks <= 0:
++            raise ValueError("persistent_blocks must be positive")
++        if physical_blocks < 0:
++            raise ValueError("physical_blocks must be non-negative")
++        if physical_upper_bound < physical_blocks:
++            raise ValueError("physical upper bound is below current ownership")
++
++    @staticmethod
++    def _restore(mapping: dict[str, int], key: str, value: int | None) -> None:
++        if value is None:
++            mapping.pop(key, None)
++        else:
++            mapping[key] = value
++
++    def _assert_invariants(self) -> None:
++        if self.free_blocks < 0:
++            raise RuntimeError("hybrid KV admission exceeded capacity")
++        if len(self.batches) > self.max_in_flight_batches:
++            raise RuntimeError("hybrid KV admission exceeded the batch bound")
++        if not self.persistent.keys().isdisjoint(self.retired):
++            raise RuntimeError("retired request still has persistent credit")
++        if not self.physical.keys().isdisjoint(self.retired):
++            raise RuntimeError("retired request still has physical ownership")
++        if self.charged_blocks < self.physical_blocks + self.retired_blocks:
++            raise RuntimeError("logical KV charge undercounts physical ownership")
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 2d39a3865..9f5c6594a 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -613,6 +613,60 @@ class KVCacheManager:
+ 
+         return self.create_kv_cache_blocks(new_blocks)
+ 
++    def get_admission_blocks(self, max_num_tokens: int) -> int:
++        """Return the global-pool charge for a request's declared extent."""
++        if not 0 < max_num_tokens <= self.max_model_len:
++            raise ValueError("max_num_tokens is outside the model length")
++        total = 0
++        for manager in self.coordinator.single_type_managers:
++            required = cdiv(max_num_tokens, manager.kv_cache_spec.block_size)
++            if manager.admission_block_cap is not None:
++                required = min(required, manager.admission_block_cap)
++            total += required
++        return total
++
++    def prepare_speculative_allocation(
++        self,
++        request: Request,
++        num_new_tokens: int,
++        num_lookahead_tokens: int,
++    ) -> tuple[int, int]:
++        """Return current ownership and the imminent physical upper bound.
++
++        Processed sliding-window blocks are reclaimed before calculating the
++        bound, matching :meth:`allocate_slots`. Prefix caching is excluded by
++        the fixed-length speculative admission configuration.
++        """
++        if self.enable_caching:
++            raise ValueError("speculative admission requires no prefix cache")
++        if num_new_tokens <= 0 or num_lookahead_tokens < 0:
++            raise ValueError("invalid speculative allocation lengths")
++
++        total_computed_tokens = request.num_computed_tokens
++        self.coordinator.remove_skipped_blocks(
++            request.request_id,
++            max(0, total_computed_tokens - request.num_in_flight_tokens),
++            num_prompt_tokens=request.num_prompt_tokens,
++        )
++        current_physical = sum(
++            len(group)
++            for group in self.get_unique_physical_block_ids(request.request_id)
++        )
++        num_tokens_main_model = total_computed_tokens + num_new_tokens
++        num_tokens_need_slot = min(
++            num_tokens_main_model + num_lookahead_tokens, self.max_model_len
++        )
++        new_blocks = self.coordinator.get_num_blocks_to_allocate(
++            request_id=request.request_id,
++            num_tokens=num_tokens_need_slot,
++            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
++            num_encoder_tokens=0,
++            total_computed_tokens=total_computed_tokens,
++            num_local_computed_tokens=total_computed_tokens,
++            num_tokens_main_model=num_tokens_main_model,
++        )
++        return current_physical, current_physical + new_blocks
++
+     def free(self, request: Request) -> None:
+         """Free the blocks allocated for the request.
+         We free the blocks in reverse order so that the tail blocks are evicted
+@@ -754,6 +808,15 @@ class KVCacheManager:
+         """Get the block ids of a request."""
+         return self.get_blocks(request_id).get_block_ids()
+ 
++    def get_unique_physical_block_ids(
++        self, request_id: str
++    ) -> tuple[tuple[int, ...], ...]:
++        """Return unique live physical block IDs for every cache group."""
++        return tuple(
++            tuple(dict.fromkeys(block.block_id for block in group if not block.is_null))
++            for group in self.get_blocks(request_id).blocks
++        )
++
+     def get_block_ids_for_computed_tokens(
+         self,
+         request_id: str,
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 0da64cf27..3168909a5 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -314,6 +314,9 @@ class SchedulerOutput:
+     # Number of spec tokens to schedule for the next step.
+     num_spec_tokens_to_schedule: int = 0
+ 
++    # Settlement epoch for fixed-length speculative hybrid-KV admission.
++    kv_admission_batch_id: int | None = None
++
+     @classmethod
+     def make_empty(cls) -> "SchedulerOutput":
+         return cls(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8b188de13..b0b5f3490 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -35,6 +35,12 @@ from vllm.v1.core.encoder_cache_manager import (
+     EncoderCacheManager,
+     EncoderDecoderCacheManager,
+ )
++from vllm.v1.core.kv_admission import (
++    AdmissionReservation,
++    HybridKVAdmissionLedger,
++    get_request_admission_length,
++    validate_hybrid_kv_admission,
++)
+ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
+@@ -53,10 +59,18 @@ from vllm.v1.core.sched.request_queue import (
+     create_request_queue,
+ )
+ from vllm.v1.core.sched.utils import check_stop, remove_all
++from vllm.v1.core.speculative_admission import (
++    SpeculativeAdmissionOverlay,
++    select_graph_aware_speculative_depth,
++    speculative_depth_fallbacks,
++    validate_hybrid_mtp_admission,
++)
+ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+ from vllm.v1.kv_cache_interface import (
++    FullAttentionSpec,
+     KVCacheConfig,
+     MambaSpec,
++    SlidingWindowSpec,
+     get_mamba_prefill_checkpoint_position,
+     is_mamba_prefill_checkpoint_valid,
+ )
+@@ -310,10 +324,72 @@ class Scheduler(SchedulerInterface):
+         if hash_block_size is None:
+             hash_block_size = block_size
+         self.hash_block_size = hash_block_size
++        use_hybrid_kv_admission = self.scheduler_config.hybrid_kv_cache_admission
++        use_speculative_admission = (
++            self.scheduler_config.hybrid_kv_speculative_admission
++        )
++        if use_speculative_admission and not use_hybrid_kv_admission:
++            raise ValueError(
++                "hybrid KV speculative admission requires hybrid KV cache admission"
++            )
++        if use_hybrid_kv_admission:
++            validate_hybrid_kv_admission(
++                has_connector=self.connector is not None
++                or self.ec_connector is not None,
++                is_encoder_decoder=self.is_encoder_decoder,
++                has_mamba_layers=kv_cache_config.has_mamba_layers,
++                prefix_caching=self.cache_config.enable_prefix_caching,
++                cache_groups_supported=all(
++                    isinstance(
++                        group.kv_cache_spec,
++                        (SlidingWindowSpec, FullAttentionSpec),
++                    )
++                    for group in kv_cache_config.kv_cache_groups
++                ),
++                max_concurrent_batches=vllm_config.max_concurrent_batches,
++            )
++            if speculative_config is not None and not use_speculative_admission:
++                raise ValueError(
++                    "speculative decoding with hybrid KV cache admission "
++                    "requires hybrid KV speculative admission"
++                )
++        if use_speculative_admission:
++            model_type = getattr(
++                vllm_config.model_config.hf_text_config, "model_type", None
++            )
++            architectures = getattr(
++                vllm_config.model_config.hf_config, "architectures", ()
++            )
++            validate_hybrid_mtp_admission(
++                speculative_method=(
++                    speculative_config.method
++                    if speculative_config is not None
++                    else None
++                ),
++                num_spec_tokens=self.num_spec_tokens,
++                use_eagle=self.use_eagle,
++                num_lookahead_tokens=self.num_lookahead_tokens,
++                dynamic_speculation=self.dynamic_sd_lookup is not None,
++                model_type=model_type,
++                architectures=architectures,
++                dynamic_speculative_depths=(
++                    tuple(
++                        depth
++                        for _, _, depth in (
++                            speculative_config.num_speculative_tokens_per_batch_size
++                        )
++                    )
++                    if speculative_config is not None
++                    and speculative_config.num_speculative_tokens_per_batch_size
++                    else ()
++                ),
++            )
+         self.kv_cache_manager = KVCacheManager(
+             kv_cache_config=kv_cache_config,
+             max_model_len=self.max_model_len,
+-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
++            max_in_flight_tokens=(
++                0 if use_hybrid_kv_admission else vllm_config.max_in_flight_tokens
++            ),
+             enable_caching=self.cache_config.enable_prefix_caching,
+             use_eagle=self.use_eagle_block_drop,
+             num_prefill_lookahead=self.num_prefill_lookahead,
+@@ -333,6 +409,40 @@ class Scheduler(SchedulerInterface):
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+ 
++        self.hybrid_kv_admission: HybridKVAdmissionLedger | None = None
++        self.hybrid_kv_speculative_admission: SpeculativeAdmissionOverlay | None = None
++        self._hybrid_kv_batch_seq = 0
++        self._hybrid_no_progress_steps = 0
++        self._hybrid_last_required_growth = 0
++        self._hybrid_admission_blocked = False
++        self._hybrid_last_logged_contract: tuple[int, int] | None = None
++        self._hybrid_dynamic_speculation = bool(
++            use_speculative_admission and self.dynamic_sd_lookup is not None
++        )
++        capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes or ()
++        self._hybrid_max_graph_tokens = max(capture_sizes, default=0)
++        if use_hybrid_kv_admission:
++            capacity_blocks = (
++                self.kv_cache_manager.block_pool.get_num_free_blocks()
++                - self.kv_cache_manager.watermark_blocks
++            )
++            self.hybrid_kv_admission = HybridKVAdmissionLedger(
++                capacity_blocks=capacity_blocks,
++                max_in_flight_batches=vllm_config.max_concurrent_batches,
++            )
++            if use_speculative_admission:
++                self.hybrid_kv_speculative_admission = SpeculativeAdmissionOverlay(
++                    self.hybrid_kv_admission
++                )
++            self.defer_block_free = True
++            logger.info(
++                "Hybrid KV cache admission enabled: capacity=%d blocks, "
++                "max in-flight batches=%d, speculative=%s",
++                capacity_blocks,
++                vllm_config.max_concurrent_batches,
++                use_speculative_admission,
++            )
++
+         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
+         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
+@@ -559,8 +669,195 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+ 
++    def _request_physical_blocks(self, request_id: str) -> int:
++        return sum(
++            len(group)
++            for group in self.kv_cache_manager.get_unique_physical_block_ids(request_id)
++        )
++
++    def _request_admission_blocks(self, request: Request) -> int:
++        max_total_tokens = get_request_admission_length(
++            prompt_tokens=request.num_prompt_tokens,
++            max_tokens=request.max_tokens,
++            max_model_len=self.max_model_len,
++        )
++        return self.kv_cache_manager.get_admission_blocks(max_total_tokens)
++
++    def _select_hybrid_speculative_depth(self, candidate_count: int) -> tuple[int, int]:
++        """Select k before reservation and return (k, batch-member limit).
++
++        The configured dynamic schedule remains the policy source. The graph
++        limit only bounds membership when even the shallowest supported depth
++        would exceed the largest captured token count.
++        """
++        if candidate_count <= 0 or self.dynamic_sd_lookup is None:
++            return self.num_spec_tokens, max(candidate_count, 1)
++        if not self._hybrid_dynamic_speculation:
++            lookup_index = min(candidate_count, len(self.dynamic_sd_lookup) - 1)
++            selected_k = self.dynamic_sd_lookup[lookup_index]
++            return selected_k, candidate_count
++        return select_graph_aware_speculative_depth(
++            candidate_count=candidate_count,
++            depth_lookup=self.dynamic_sd_lookup,
++            max_graph_tokens=self._hybrid_max_graph_tokens,
++        )
++
++    def _hybrid_admission_diagnostic(self, required_growth: int) -> str:
++        ledger = self.hybrid_kv_admission
++        if ledger is None:
++            return "hybrid admission disabled"
++        return (
++            f"physical_free={self.kv_cache_manager.block_pool.get_num_free_blocks()} "
++            f"charged={ledger.charged_blocks} physical={ledger.physical_blocks} "
++            f"retained={ledger.stranded_blocks} required_crossing={required_growth} "
++            f"in_flight_epochs={tuple(sorted(ledger.batches))}"
++        )
++
++    def _reserve_hybrid_kv_credits(
++        self,
++        request: Request,
++        batch_id: int,
++        requested_tokens: int,
++        num_lookahead_tokens: int,
++        selected_k: int,
++    ) -> tuple[int, AdmissionReservation | None]:
++        ledger = self.hybrid_kv_admission
++        if ledger is None:
++            return requested_tokens, None
++        persistent_blocks = self._request_admission_blocks(request)
++
++        def allocation_bound(tokens: int) -> tuple[int, int]:
++            return self.kv_cache_manager.prepare_speculative_allocation(
++                request, tokens, num_lookahead_tokens
++            )
++
++        def physical_growth_fits(physical: int, upper: int) -> bool:
++            growth = max(0, upper - physical)
++            self._hybrid_last_required_growth = growth
++            return growth <= self.kv_cache_manager.block_pool.get_num_free_blocks()
++
++        def try_reserve(physical: int, upper: int) -> AdmissionReservation | None:
++            if self.hybrid_kv_speculative_admission is not None:
++                return self.hybrid_kv_speculative_admission.try_reserve(
++                    batch_id=batch_id,
++                    request_id=request.request_id,
++                    persistent_blocks=persistent_blocks,
++                    physical_blocks=physical,
++                    physical_upper_bound=upper,
++                    selected_k=selected_k,
++                    lookahead_tokens=num_lookahead_tokens,
++                    completion_epoch=batch_id,
++                )
++            return ledger.try_reserve(
++                batch_id=batch_id,
++                request_id=request.request_id,
++                persistent_blocks=persistent_blocks,
++                physical_blocks=physical,
++                physical_upper_bound=upper,
++            )
++
++        # Verification is all-or-nothing. Shortening a fixed speculation step
++        # changes its kernel shape and acceptance contract.
++        if requested_tokens <= 1 + self.num_spec_tokens:
++            physical, upper = allocation_bound(requested_tokens)
++            if not physical_growth_fits(physical, upper):
++                self._hybrid_admission_blocked = True
++                return 0, None
++            reservation = try_reserve(physical, upper)
++            if reservation is None:
++                self._hybrid_admission_blocked = True
++                return 0, None
++            return requested_tokens, reservation
++
++        low = 0
++        high = requested_tokens
++        while low < high:
++            middle = (low + high + 1) // 2
++            physical, upper = allocation_bound(middle)
++            if physical_growth_fits(physical, upper) and ledger.can_reserve(
++                batch_id=batch_id,
++                request_id=request.request_id,
++                persistent_blocks=persistent_blocks,
++                physical_blocks=physical,
++                physical_upper_bound=upper,
++            ):
++                low = middle
++            else:
++                high = middle - 1
++        if low == 0:
++            self._hybrid_admission_blocked = True
++            return 0, None
++
++        physical, upper = allocation_bound(low)
++        if not physical_growth_fits(physical, upper):
++            self._hybrid_admission_blocked = True
++            return 0, None
++        reservation = try_reserve(physical, upper)
++        if reservation is None:
++            self._hybrid_admission_blocked = True
++            return 0, None
++        return low, reservation
++
++    def _commit_hybrid_kv_allocation(
++        self, reservation: AdmissionReservation | None, request_id: str
++    ) -> None:
++        if reservation is None:
++            return
++        if self.hybrid_kv_admission is None:
++            raise RuntimeError("hybrid KV admission is not configured")
++        self.hybrid_kv_admission.commit_allocation(
++            reservation, self._request_physical_blocks(request_id)
++        )
++
++    def _reserve_hybrid_decode_with_fallback(
++        self,
++        request: Request,
++        batch_id: int,
++        requested_tokens: int,
++        selected_k: int,
++        allow_fallback: bool,
++    ) -> tuple[int, AdmissionReservation | None, int]:
++        """Try depth, then shallower depth, then one target-only token."""
++        candidates = [selected_k]
++        if allow_fallback and self._hybrid_dynamic_speculation:
++            candidates = list(speculative_depth_fallbacks(selected_k))
++        for candidate_k in dict.fromkeys(candidates):
++            candidate_tokens = min(requested_tokens, candidate_k + 1)
++            tokens, reservation = self._reserve_hybrid_kv_credits(
++                request,
++                batch_id,
++                candidate_tokens,
++                candidate_k,
++                candidate_k,
++            )
++            if tokens > 0:
++                if candidate_k != selected_k:
++                    logger.warning(
++                        "Hybrid speculative admission reduced depth k=%d->%d: %s",
++                        selected_k,
++                        candidate_k,
++                        self._hybrid_admission_diagnostic(
++                            self._hybrid_last_required_growth
++                        ),
++                    )
++                return tokens, reservation, candidate_k
++        return 0, None, selected_k
++
++    def _rollback_hybrid_kv_credits(
++        self, reservation: AdmissionReservation | None
++    ) -> None:
++        if reservation is None:
++            return
++        if self.hybrid_kv_admission is None:
++            raise RuntimeError("hybrid KV admission is not configured")
++        if self.hybrid_kv_speculative_admission is not None:
++            self.hybrid_kv_speculative_admission.rollback(reservation)
++        else:
++            self.hybrid_kv_admission.rollback(reservation)
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
++        self._hybrid_admission_blocked = False
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+         # Each request just has the num_computed_tokens and
+@@ -580,6 +877,14 @@ class Scheduler(SchedulerInterface):
+         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+         num_scheduled_tokens: dict[str, int] = {}
+         token_budget = self.max_num_scheduled_tokens
++        hybrid_kv_batch_id = self._hybrid_kv_batch_seq + 1
++        hybrid_candidate_count = min(
++            self.max_num_running_reqs,
++            sum(self.get_request_counts()),
++        )
++        hybrid_selected_k, hybrid_member_limit = self._select_hybrid_speculative_depth(
++            hybrid_candidate_count
++        )
+         spec = self.vllm_config.speculative_config
+         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
+         input_budget = self.scheduler_config.max_num_batched_tokens
+@@ -628,6 +933,11 @@ class Scheduler(SchedulerInterface):
+         # First, schedule the RUNNING requests.
+         req_index = 0
+         while req_index < len(self.running) and token_budget > 0:
++            if (
++                self._hybrid_dynamic_speculation
++                and len(scheduled_running_reqs) >= hybrid_member_limit
++            ):
++                break
+             request = self.running[req_index]
+             if input_budget <= draft_slots:
+                 break
+@@ -741,17 +1051,79 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            admission_reservation = None
++            if self.hybrid_kv_admission is not None:
++                # The bounded speculative fallback contract applies only to
++                # decode/verification work.  A RUNNING request can still be
++                # consuming a chunked prefill; truncating that chunk to k + 1
++                # turns normal prefill into a sequence of tiny decode-shaped
++                # launches and is not part of speculative admission.
++                if self._hybrid_dynamic_speculation and not request.is_prefill_chunk:
++                    (
++                        num_new_tokens,
++                        admission_reservation,
++                        reserved_k,
++                    ) = self._reserve_hybrid_decode_with_fallback(
++                        request,
++                        hybrid_kv_batch_id,
++                        num_new_tokens,
++                        hybrid_selected_k,
++                        allow_fallback=not scheduled_running_reqs,
++                    )
++                    if reserved_k != hybrid_selected_k:
++                        hybrid_selected_k = reserved_k
++                        if self._hybrid_max_graph_tokens:
++                            hybrid_member_limit = max(
++                                1,
++                                self._hybrid_max_graph_tokens // (reserved_k + 1),
++                            )
++                else:
++                    num_new_tokens, admission_reservation = (
++                        self._reserve_hybrid_kv_credits(
++                            request,
++                            hybrid_kv_batch_id,
++                            num_new_tokens,
++                            (
++                                hybrid_selected_k
++                                if self._hybrid_dynamic_speculation
++                                else self.num_lookahead_tokens
++                            ),
++                            (
++                                hybrid_selected_k
++                                if self._hybrid_dynamic_speculation
++                                else self.num_spec_tokens
++                            ),
++                        )
++                    )
++                if num_new_tokens == 0:
++                    if scheduled_running_reqs:
++                        break
++                    req_index += 1
++                    continue
++
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
+                     new_blocks = self.kv_cache_manager.allocate_slots(
+                         request,
+                         num_new_tokens,
+-                        num_lookahead_tokens=self.num_lookahead_tokens,
++                        num_lookahead_tokens=(
++                            hybrid_selected_k
++                            if self._hybrid_dynamic_speculation
++                            else self.num_lookahead_tokens
++                        ),
+                     )
+ 
+                     if new_blocks is not None:
+                         # The request can be scheduled.
++                        self._commit_hybrid_kv_allocation(
++                            admission_reservation, request.request_id
++                        )
++                        break
++
++                    if self.hybrid_kv_admission is not None:
++                        self._rollback_hybrid_kv_credits(admission_reservation)
++                        admission_reservation = None
+                         break
+ 
+                     if (
+@@ -1176,7 +1548,13 @@ class Scheduler(SchedulerInterface):
+                 # mismatching local and remote block counts.
+                 limit_lookahead_tokens = load_kv_async and self.num_lookahead_tokens > 0
+                 effective_lookahead_tokens = (
+-                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
++                    0
++                    if limit_lookahead_tokens
++                    else (
++                        hybrid_selected_k
++                        if self._hybrid_dynamic_speculation
++                        else self.num_lookahead_tokens
++                    )
+                 )
+ 
+                 # Determine if we need to allocate cross-attention blocks.
+@@ -1203,6 +1581,20 @@ class Scheduler(SchedulerInterface):
+                         + self._spec_decode_step_blocks()
+                     )
+ 
++                admission_reservation = None
++                if self.hybrid_kv_admission is not None:
++                    num_new_tokens, admission_reservation = (
++                        self._reserve_hybrid_kv_credits(
++                            request,
++                            hybrid_kv_batch_id,
++                            num_new_tokens,
++                            effective_lookahead_tokens,
++                            hybrid_selected_k,
++                        )
++                    )
++                    if num_new_tokens == 0:
++                        break
++
+                 # Replayed tokens are already counted in the adopted hit; a
+                 # chunk that ends inside the replayed range needs no new slots.
+                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
+@@ -1223,12 +1615,18 @@ class Scheduler(SchedulerInterface):
+                 if new_blocks is None:
+                     # The request cannot be scheduled.
+ 
++                    self._rollback_hybrid_kv_credits(admission_reservation)
++
+                     # NOTE: we need to untouch the request from the encode cache
+                     # manager
+                     if request.has_encoder_inputs:
+                         self.encoder_cache_manager.free(request)
+                     break
+ 
++                self._commit_hybrid_kv_allocation(
++                    admission_reservation, request.request_id
++                )
++
+                 # KVTransfer: the connector uses this info to determine
+                 # if a load is needed. Note that
+                 # This information is used to determine if a load is
+@@ -1442,9 +1840,13 @@ class Scheduler(SchedulerInterface):
+             self._free_cow_retained_blocks(cow_retained_blocks, self.sched_step_seq + 1)
+         pending_kv_cache_block_copies = kv_cache_block_copies or None
+ 
+-        # Dynamic speculative decoding: compute optimal K
++        # Dynamic speculative decoding. Hybrid admission selected k before any
++        # reservation; non-hybrid configurations retain the upstream late
++        # lookup behavior.
+         num_spec_tokens_to_schedule = self.num_spec_tokens
+-        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
++        if self._hybrid_dynamic_speculation and len(num_scheduled_tokens) > 0:
++            num_spec_tokens_to_schedule = hybrid_selected_k
++        elif self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                 len(num_scheduled_tokens)
+             ]
+@@ -1458,6 +1860,77 @@ class Scheduler(SchedulerInterface):
+                 scheduled_encoder_inputs
+             )
+ 
++        admission_batch_id = None
++        if (
++            self.hybrid_kv_admission is not None
++            and hybrid_kv_batch_id in self.hybrid_kv_admission.batches
++        ):
++            if total_num_scheduled_tokens <= 0:
++                raise RuntimeError("hybrid KV reservation has no scheduled work")
++            admission_batch_id = hybrid_kv_batch_id
++            self._hybrid_kv_batch_seq = hybrid_kv_batch_id
++            if self.hybrid_kv_speculative_admission is None:
++                contract = None
++            else:
++                contract = self.hybrid_kv_speculative_admission.batch_contract(
++                    admission_batch_id
++                )
++            if (
++                contract is not None
++                and contract.selected_k != num_spec_tokens_to_schedule
++            ):
++                raise RuntimeError(
++                    "speculative batch contract differs from execution depth: "
++                    f"contract={contract.selected_k}, "
++                    f"execution={num_spec_tokens_to_schedule}"
++                )
++            contract_signature = (
++                (contract.selected_k, len(contract.request_ids))
++                if contract is not None
++                else None
++            )
++            if (
++                contract is not None
++                and self.observability_config.enable_logging_iteration_details
++                and contract_signature != self._hybrid_last_logged_contract
++            ):
++                logger.info(
++                    "Hybrid speculative batch: batch=%d k=%d lookahead=%d "
++                    "members=%d target_tokens=%d completion_epoch=%d",
++                    admission_batch_id,
++                    contract.selected_k,
++                    contract.lookahead_tokens,
++                    len(contract.request_ids),
++                    total_num_scheduled_tokens,
++                    contract.completion_epoch,
++                )
++                self._hybrid_last_logged_contract = contract_signature
++
++        if (
++            self.hybrid_kv_admission is not None
++            and self.running
++            and total_num_scheduled_tokens == 0
++            and self._hybrid_admission_blocked
++        ):
++            self._hybrid_no_progress_steps += 1
++            if not self.hybrid_kv_admission.batches:
++                raise RuntimeError(
++                    "hybrid KV admission cannot advance even one target-only "
++                    "request: "
++                    + self._hybrid_admission_diagnostic(
++                        self._hybrid_last_required_growth
++                    )
++                )
++            if self._hybrid_no_progress_steps % 8 == 0:
++                logger.warning(
++                    "Hybrid KV admission no-progress watchdog: %s",
++                    self._hybrid_admission_diagnostic(
++                        self._hybrid_last_required_growth
++                    ),
++                )
++        else:
++            self._hybrid_no_progress_steps = 0
++
+         scheduler_output = SchedulerOutput(
+             scheduled_new_reqs=new_reqs_data,
+             scheduled_cached_reqs=cached_reqs_data,
+@@ -1479,6 +1952,7 @@ class Scheduler(SchedulerInterface):
+             kv_cache_block_copies=pending_kv_cache_block_copies,
+             kv_connector_block_state=kv_connector_block_state,
+             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
++            kv_admission_batch_id=admission_batch_id,
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+         )
+ 
+@@ -2266,6 +2740,34 @@ class Scheduler(SchedulerInterface):
+                     )
+                 )
+ 
++        admission_batch_id = scheduler_output.kv_admission_batch_id
++        if admission_batch_id is not None:
++            if self.hybrid_kv_admission is None:
++                raise RuntimeError("hybrid KV admission batch without a ledger")
++            physical_blocks: dict[str, int] = {}
++            admission_blocks: dict[str, int] = {}
++            for req_id in self.hybrid_kv_admission.batch_request_bounds(
++                admission_batch_id
++            ):
++                request = self.requests.get(req_id)
++                if request is None or request.is_finished():
++                    continue
++                physical_blocks[req_id] = self._request_physical_blocks(req_id)
++                admission_blocks[req_id] = self._request_admission_blocks(request)
++            if self.hybrid_kv_speculative_admission is not None:
++                self.hybrid_kv_speculative_admission.settle_batch(
++                    admission_batch_id,
++                    physical_blocks=physical_blocks,
++                    persistent_blocks=admission_blocks,
++                    completion_epoch=admission_batch_id,
++                )
++            else:
++                self.hybrid_kv_admission.settle_batch(
++                    admission_batch_id,
++                    physical_blocks=physical_blocks,
++                    persistent_blocks=admission_blocks,
++                )
++
+         # KV Connector: update state for finished KV Transfers.
+         if kv_connector_output:
+             self._update_from_kv_xfer_finished(kv_connector_output)
+@@ -2655,6 +3157,11 @@ class Scheduler(SchedulerInterface):
+         if self.aux_output_connector is not None:
+             self.aux_output_connector.request_finished(request)
+         self._inflight_prefills.discard(request)
++        if self.hybrid_kv_admission is not None:
++            self.hybrid_kv_admission.finish_request(
++                request.request_id,
++                physical_blocks=self._request_physical_blocks(request.request_id),
++            )
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+ 
+         # EC Connector: mirror the KV hook. The contract requires firing
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index a097c9e92..1e933e6c9 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -159,6 +159,10 @@ class SingleTypeKVCacheManager(ABC):
+             tuple[str, int, KVCacheBlock, int]
+         ] = []
+ 
++    @property
++    def admission_block_cap(self) -> int | None:
++        return self.max_admission_blocks_per_request
++
+     @classmethod
+     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
+         return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
+diff --git a/vllm/v1/core/speculative_admission.py b/vllm/v1/core/speculative_admission.py
+new file mode 100644
+index 000000000..34d3e2c42
+--- /dev/null
++++ b/vllm/v1/core/speculative_admission.py
+@@ -0,0 +1,174 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Speculative policy and transaction metadata over hybrid KV admission."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from vllm.v1.core.kv_admission import (
++    AdmissionReservation,
++    HybridKVAdmissionLedger,
++)
++
++
++def select_graph_aware_speculative_depth(
++    *,
++    candidate_count: int,
++    depth_lookup: list[int],
++    max_graph_tokens: int,
++) -> tuple[int, int]:
++    """Return the configured depth and graph-bounded batch membership."""
++    if candidate_count <= 0:
++        raise ValueError("candidate_count must be positive")
++    if candidate_count >= len(depth_lookup):
++        raise ValueError("candidate_count exceeds the bounded depth lookup")
++    selected_k = depth_lookup[candidate_count]
++    if selected_k not in (2, 3, 4):
++        raise ValueError(f"unsupported dynamic MTP depth k={selected_k}")
++    if max_graph_tokens <= 0:
++        return selected_k, candidate_count
++    member_limit = max(1, max_graph_tokens // (selected_k + 1))
++    return selected_k, min(candidate_count, member_limit)
++
++
++def speculative_depth_fallbacks(selected_k: int) -> tuple[int, ...]:
++    """Depth-first liveness order ending in one target-only operation."""
++    if selected_k not in (2, 3, 4):
++        raise ValueError(f"unsupported dynamic MTP depth k={selected_k}")
++    return tuple(k for k in (4, 3, 2) if k <= selected_k) + (0,)
++
++
++def validate_hybrid_mtp_admission(
++    *,
++    speculative_method: str | None,
++    num_spec_tokens: int,
++    use_eagle: bool,
++    num_lookahead_tokens: int,
++    dynamic_speculation: bool,
++    model_type: str | None,
++    architectures: tuple[str, ...] | list[str],
++    dynamic_speculative_depths: tuple[int, ...] | list[int] = (),
++) -> None:
++    """Fail closed outside bounded Gemma 4 MTP configurations."""
++    if speculative_method != "mtp" or not use_eagle:
++        raise ValueError("MTP hybrid admission supports only the built-in MTP method")
++    if num_spec_tokens < 1 or num_lookahead_tokens != num_spec_tokens:
++        raise ValueError(
++            "MTP hybrid admission requires bounded speculation with matching "
++            "maximum lookahead"
++        )
++    if dynamic_speculation:
++        depths = set(dynamic_speculative_depths)
++        if num_spec_tokens != 4 or not depths or not depths.issubset({2, 3, 4}):
++            raise ValueError(
++                "dynamic MTP hybrid admission supports only max k=4 with a "
++                "bounded k=2/3/4 schedule"
++            )
++    if model_type not in ("gemma4", "gemma4_text") or (
++        "Gemma4ForConditionalGeneration" not in architectures
++    ):
++        raise ValueError("MTP hybrid admission supports only Gemma 4")
++
++
++@dataclass(frozen=True)
++class SpeculativeBatchContract:
++    batch_id: int
++    selected_k: int
++    lookahead_tokens: int
++    request_ids: tuple[str, ...]
++    completion_epoch: int
++
++
++class SpeculativeAdmissionOverlay:
++    """Bind immutable speculative execution metadata to generic KV credits."""
++
++    def __init__(self, ledger: HybridKVAdmissionLedger) -> None:
++        self.ledger = ledger
++        self._contracts: dict[int, SpeculativeBatchContract] = {}
++
++    def batch_contract(self, batch_id: int) -> SpeculativeBatchContract:
++        try:
++            return self._contracts[batch_id]
++        except KeyError:
++            raise KeyError(batch_id) from None
++
++    def try_reserve(
++        self,
++        *,
++        batch_id: int,
++        request_id: str,
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++        selected_k: int,
++        lookahead_tokens: int,
++        completion_epoch: int,
++    ) -> AdmissionReservation | None:
++        if selected_k < 0 or lookahead_tokens < selected_k:
++            raise ValueError("invalid speculative batch contract")
++        if completion_epoch <= 0:
++            raise ValueError("completion_epoch must be positive")
++        contract = self._contracts.get(batch_id)
++        if contract is not None and (
++            contract.selected_k != selected_k
++            or contract.lookahead_tokens != lookahead_tokens
++            or contract.completion_epoch != completion_epoch
++        ):
++            raise ValueError(f"inconsistent contract for batch {batch_id}")
++
++        reservation = self.ledger.try_reserve(
++            batch_id=batch_id,
++            request_id=request_id,
++            persistent_blocks=persistent_blocks,
++            physical_blocks=physical_blocks,
++            physical_upper_bound=physical_upper_bound,
++        )
++        if reservation is None:
++            return None
++        request_ids = contract.request_ids if contract is not None else ()
++        self._contracts[batch_id] = SpeculativeBatchContract(
++            batch_id=batch_id,
++            selected_k=selected_k,
++            lookahead_tokens=lookahead_tokens,
++            request_ids=(*request_ids, request_id),
++            completion_epoch=completion_epoch,
++        )
++        return reservation
++
++    def rollback(self, reservation: AdmissionReservation) -> None:
++        contract = self.batch_contract(reservation.batch_id)
++        self.ledger.rollback(reservation)
++        request_ids = tuple(
++            request_id
++            for request_id in contract.request_ids
++            if request_id != reservation.request_id
++        )
++        if request_ids:
++            self._contracts[reservation.batch_id] = SpeculativeBatchContract(
++                batch_id=contract.batch_id,
++                selected_k=contract.selected_k,
++                lookahead_tokens=contract.lookahead_tokens,
++                request_ids=request_ids,
++                completion_epoch=contract.completion_epoch,
++            )
++        else:
++            del self._contracts[reservation.batch_id]
++
++    def settle_batch(
++        self,
++        batch_id: int,
++        physical_blocks: dict[str, int],
++        persistent_blocks: dict[str, int],
++        completion_epoch: int,
++    ) -> None:
++        contract = self.batch_contract(batch_id)
++        if completion_epoch != contract.completion_epoch:
++            raise ValueError(
++                f"stale completion epoch {completion_epoch}; "
++                f"expected {contract.completion_epoch}"
++            )
++        if tuple(self.ledger.batch_request_bounds(batch_id)) != contract.request_ids:
++            raise RuntimeError("speculative membership differs from KV reservation")
++        self.ledger.settle_batch(batch_id, physical_blocks, persistent_blocks)
++        del self._contracts[batch_id]
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 3ff0832b1..93c6c74d3 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -870,8 +870,13 @@ class SlidingWindowSpec(AttentionSpec):
+             not self.dcp_sharded
+             or vllm_config.parallel_config.decode_context_parallel_size == 1
+         ), "DCP not support sliding window."
++        max_in_flight_tokens = (
++            0
++            if vllm_config.scheduler_config.hybrid_kv_cache_admission
++            else vllm_config.max_in_flight_tokens
++        )
+         max_blocks = self.max_admission_blocks_per_request(
+-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
++            max_in_flight_tokens=max_in_flight_tokens,
+             max_model_len=vllm_config.model_config.max_model_len,
+         )
+         return max_blocks * self.page_size_bytes
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index fa1dc4a04..ac6a55de3 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -267,10 +267,12 @@ class CudaGraphManager:
+         # draft tokens. The scheduler might use a smaller number so we need
+         # to capture graphs for all possible values during decode.
+         speculative_config = self.vllm_config.speculative_config
+-        if (
++        target_dynamic_decode = (
+             speculative_config
+             and speculative_config.uses_dynamic_speculative_decoding()
+-        ):
++            and self.decode_query_len == self.vllm_config.num_speculative_tokens + 1
++        )
++        if target_dynamic_decode:
+             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
+             # _per_step. Recover num_new_sampled_tokens_per_step
+             # from the values the manager already has.
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index a6ef84bbd..0a59f6dd9 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import math
++import weakref
+ from collections import defaultdict
+ from collections.abc import Iterable, Mapping, Sequence
+ from dataclasses import dataclass, field
+@@ -25,6 +26,7 @@ from vllm.v1.attention.backend import (
+     AttentionBackend,
+     AttentionMetadataBuilder,
+     MultipleOf,
++    sync_kv_scale_consumer,
+ )
+ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+ from vllm.v1.kv_cache_interface import (
+@@ -34,10 +36,12 @@ from vllm.v1.kv_cache_interface import (
+     KVCacheGroupSpec,
+     KVCacheLayout,
+     KVCacheSpec,
++    KVQuantMode,
+     MambaSpec,
+     MLAAttentionSpec,
+     UniformTypeKVCacheSpecs,
+     create_kv_cache_views,
++    get_kv_quant_mode,
+ )
+ from vllm.v1.worker.block_table import get_block_table_width
+ 
+@@ -661,6 +665,42 @@ def bind_kv_cache_to_layers(
+     for layer_name, kv_cache in kv_caches.items():
+         forward_context[layer_name].bind_kv_cache(kv_cache)
+ 
++    # KV sharing owns more than storage: quantized cache consumers must use
++    # the cache owner's calibrated K/V dequantization state. Q scales remain
++    # local to the layer performing the launch.
++    for layer_name, consumer in forward_context.items():
++        target_layer_name = getattr(consumer, "kv_sharing_target_layer_name", None)
++        if target_layer_name is None:
++            continue
++        owner = forward_context.get(target_layer_name)
++        if owner is None:
++            raise ValueError(
++                f"shared KV-cache owner {target_layer_name!r} for "
++                f"{layer_name!r} is not present during cache binding"
++            )
++        if consumer.kv_cache is not owner.kv_cache:
++            raise ValueError(
++                f"shared KV-cache consumer {layer_name!r} does not alias "
++                f"owner {target_layer_name!r}"
++            )
++        consumer_mode = get_kv_quant_mode(consumer.kv_cache_dtype)
++        owner_mode = get_kv_quant_mode(owner.kv_cache_dtype)
++        if consumer_mode != owner_mode:
++            raise ValueError(
++                f"shared KV-cache quantization mismatch for {layer_name!r}: "
++                f"consumer={consumer_mode}, owner={owner_mode}"
++            )
++        if consumer_mode != KVQuantMode.FP8_PER_TENSOR:
++            continue
++        object.__setattr__(consumer, "_kv_scale_owner_ref", weakref.ref(owner))
++        consumer_refs = [
++            consumer_ref
++            for consumer_ref in getattr(owner, "_kv_scale_consumer_refs", ())
++            if consumer_ref() is not None and consumer_ref() is not consumer
++        ]
++        consumer_refs.append(weakref.ref(consumer))
++        object.__setattr__(owner, "_kv_scale_consumer_refs", consumer_refs)
++        sync_kv_scale_consumer(consumer, owner)
+     ordered_layer_names = sorted(
+         kv_caches, key=lambda name: extract_layer_index(name, num_attn_module)
+     )

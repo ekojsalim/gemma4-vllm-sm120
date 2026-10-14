@@ -1,23 +1,19 @@
 # Modified vLLM files
 
-Every file under `overlay/vllm/` is a modified or newly added runtime file for
-the Gemma 4 SM120 deployment. The exact file list is
-`manifests/runtime-files.txt`; the corresponding review series is under
-`patches/`.
+`manifests/runtime-files.txt` identifies the 17 modified or added runtime files
+in `overlay/vllm/`. `patches/0001-Port-SM120-runtime-to-vllm-0.31.patch` contains
+the corresponding changes and regression tests against upstream commit
+`db9527a46873454610df6dbedf79a36d6bf1a7f6`.
 
-The changes provide:
+The port preserves language-only attention backend validation, bounded
+small-query segmented Triton attention, transactional hybrid-KV admission,
+separate speculative admission, shared FP8 KV-scale ownership, the optional
+Q/probability-scale contract, and the draft single-query graph guard.
 
-- language-only Gemma 4 attention selection;
-- bounded small-M segmented Triton attention;
-- transactional hybrid-KV admission and a separate speculative overlay;
-- shared FP8 KV-scale ownership;
-- bounded graph-aware speculative depth support;
-- optional assistant FP8 configuration;
-- node-local tune-once/freeze FlashInfer NVFP4 profiles; and
-- corrected optional Q/probability-scale handling and warnings.
+Adaptive verification and FlashInfer autotuning use upstream 0.31 behavior.
+The old optional FP8 assistant loader and custom tune-once/freeze autotune
+implementation are excluded. PR60689/60317 experiments are not included.
 
-The runtime overlay is compatible only with the base-image and per-file
-contracts recorded in `manifests/base-files.sha256`. It does not contain model
-weights, tokenizer files, prompts, benchmark corpora, tactic profiles, or
-private deployment configuration.
-
+Only the pinned image and per-file contract in `manifests/base-files.sha256`
+are supported. No model weights, tokenizer files, prompts, benchmark corpora,
+tactic profiles, or private deployment configuration are included.
