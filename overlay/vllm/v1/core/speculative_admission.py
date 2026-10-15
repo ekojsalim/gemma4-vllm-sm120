@@ -52,9 +52,7 @@ def validate_hybrid_mtp_admission(
 ) -> None:
     """Fail closed outside bounded Gemma 4 MTP configurations."""
     if speculative_method != "mtp" or not use_eagle:
-        raise ValueError(
-            "MTP hybrid admission supports only the built-in MTP method"
-        )
+        raise ValueError("MTP hybrid admission supports only the built-in MTP method")
     if num_spec_tokens < 1 or num_lookahead_tokens != num_spec_tokens:
         raise ValueError(
             "MTP hybrid admission requires bounded speculation with matching "

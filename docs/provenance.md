@@ -1,17 +1,18 @@
 # Provenance
 
-- Upstream: `https://github.com/vllm-project/vllm`.
+- Upstream: https://github.com/vllm-project/vllm.
 - License: Apache License 2.0; see `LICENSE` and `NOTICE`.
-- Review patch base: `568afb3a13806beb53bb2e6bd518269357b237c0`.
-- Official runtime image: `vllm/vllm-openai:v0.26.0`.
-- Immutable manifest digest:
-  `sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52`.
-- Image build revision: `ffd46bfab2128bb84146050e98b51a617c6575ab`.
-- Image creation time: `2026-07-25T02:53:04.076259045Z`.
-- GPU validation target: NVIDIA GeForce RTX 5090 / SM120.
-- Accepted historical tactic-table oracle SHA-256:
-  `eac5588baf4584fb186662316d7f7943e67dbcffa96f495fa2812994f2acef7f`.
+- Overlay version: 0.2.0.
+- Source patch base: `db9527a46873454610df6dbedf79a36d6bf1a7f6` (v0.31.0).
+- Runtime image: `docker.io/vllm/vllm-openai@sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b`.
+- Locally inspected image ID: `c76d0e2225a4b1cb1e2109ace39639f55e714abd1a7a427acc8b0bbd7f6a83b3`.
+- Image packages: vLLM 0.31.0, Torch 2.13.0+cu130, FlashInfer 0.7.0.post1,
+  Transformers 5.17.0, Triton 3.7.1.
+- GPU validation: NVIDIA GeForce RTX 5090 / SM120, October 15, 2026.
 
-The historical tactic table is not distributed and is not a production input.
-The runtime generates and freezes a compatible node-local table before serving.
-
+Base-file hashes were extracted from a fresh unmodified pinned image, not
+from the source checkout. Overlay bytes match the deployed local 0.31 bundle.
+The review patch includes both runtime modifications and corresponding tests.
+No generated autotune cache is distributed; upstream 0.31 creates node-local
+cache entries. The historical 0.26 release and its profile lifecycle remain
+available in the repository history and existing 0.1.0 release.

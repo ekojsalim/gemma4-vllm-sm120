@@ -8,7 +8,7 @@ dist="${root}/dist"
 stage=$(mktemp -d)
 trap 'rm -rf -- "${stage}"' EXIT
 
-mkdir -p "${dist}" "${stage}/${name}/manifests" "${stage}/${name}/scripts"
+mkdir -p "${dist}" "${stage}/${name}/manifests" "${stage}/${name}/scripts" "${stage}/${name}/docs"
 cp -a "${root}/overlay" "${stage}/${name}/"
 cp "${root}/LICENSE" "${root}/NOTICE" "${root}/MODIFICATIONS.md" \
   "${root}/VERSION" "${stage}/${name}/"
@@ -16,6 +16,10 @@ cp "${root}/manifests/base-files.sha256" \
   "${root}/manifests/overlay-files.sha256" \
   "${root}/manifests/runtime-files.txt" "${stage}/${name}/manifests/"
 cp "${root}/scripts/install-overlay.sh" "${stage}/${name}/scripts/"
+
+cp "${root}/README.md" "${stage}/${name}/"
+cp "${root}/docs/deployment.md" "${root}/docs/provenance.md" \
+  "${root}/docs/validation-0.31.md" "${root}/docs/ocr-bundle.json" "${stage}/${name}/docs/"
 
 archive="${dist}/${name}.tar.gz"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \

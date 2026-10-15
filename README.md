@@ -1,74 +1,90 @@
 # Gemma 4 / RTX 5090 vLLM runtime overlay
 
-This repository packages the reviewed Python runtime changes used for a Gemma
-4 ModelOpt NVFP4 target with the Gemma 4 MTP assistant on one RTX 5090. It is a
-small overlay for the official vLLM image, not a custom container image.
-
-The deployment base is pinned to:
+This repository packages the local runtime changes validated for a Gemma 4
+ModelOpt NVFP4 target with a BF16 Gemma 4 MTP assistant on one RTX 5090 (SM120).
+Overlay **0.2.0** targets **vLLM 0.31.0** and uses fixed verification of
+four draft tokens. It is an overlay for the official image, not a custom image.
 
 ```text
-docker.io/vllm/vllm-openai@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52
+docker.io/vllm/vllm-openai@sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b
 ```
 
-The image reports vLLM `0.26.0` and build revision
-`ffd46bfab2128bb84146050e98b51a617c6575ab`. The review patch base is
-`568afb3a13806beb53bb2e6bd518269357b237c0`.
+The review patch base is `db9527a46873454610df6dbedf79a36d6bf1a7f6`.
+The old 0.1.0 release remains paired with vLLM 0.26; do not install the new
+overlay over an already-patched 0.26 environment.
 
 ## Deployment contract
 
-The release asset contains only the overlay, compatibility manifests, license,
-and installer. A node startup script downloads the immutable asset, verifies
-its SHA-256, and runs:
+Build with `bash scripts/build-release.sh`. Install the asset in a fresh pinned
+image **before importing or starting vLLM**:
 
 ```bash
 bash scripts/install-overlay.sh
 ```
 
-The installer verifies vLLM `0.26.0`, every source byte in the asset, and every
-base file it will replace. It accepts an already-installed byte-identical
-overlay, but fails closed on any other base. Installation finishes before any
-vLLM process is started.
+The installer checks the vLLM version, overlay hashes, and the exact original
+bytes of every replaced file. It accepts a byte-identical installed overlay
+and rejects a different base. Python commands use `uv` and the image's Python
+interpreter (`VLLM_PYTHON` can override `/usr/bin/python3`).
 
-FlashInfer NVFP4 tactic profiles are deliberately absent. Each SM120 node tunes
-the complete bounded target domain once before readiness and reuses its frozen,
-node-local profile on later starts.
+See [deployment instructions and serving arguments](docs/deployment.md).
+An existing startup script must update the image, asset/checksum, serving
+arguments, and cache handling together. The old 0.26 startup gist is not a
+0.31 deployment recipe.
 
-## Production shape
+## Selected serving configuration
 
-- fixed default `num_speculative_tokens=4`;
-- BF16 Gemma 4 assistant;
-- ModelOpt NVFP4 target and FP8 KV cache;
-- Triton SWA/full attention;
-- CUDA graph captures through effective M=64;
-- `9,506,652,160` KV-cache bytes under the measured OCR memory pressure;
-- `max_model_len=6144`, `max_num_seqs=32`, and
-  `max_num_batched_tokens=1024`;
-- prefix caching disabled and async scheduling enabled; and
-- ordinary hybrid-KV admission plus the separate speculative overlay.
+- Fixed MTP verification, `num_speculative_tokens=4` and
+  `enable_adaptive_verification=false`.
+- ModelOpt NVFP4 target, BF16 assistant, FP8 KV cache.
+- Triton sliding-window/full attention and FlashInfer CUTLASS linear kernels.
+- Upstream 0.31 FlashInfer autotuning and a persistent, version-isolated cache.
+- Local hybrid-KV and speculative admission; CUDA graphs through 64.
+- Context 6144, max sequences 32, batch tokens 1024, async scheduling,
+  prefix caching disabled.
+- Validated local KV allocation: **8,432,910,336 bytes**, with OCR and term
+  services resident. Revalidate capacity for each node's resident services.
 
-The measured local configuration retained 14.03 simultaneous full-length
-equivalent slots with OCR resident and safely served the representative
-mixed-length corpus at concurrency 32. A new node must revalidate physical
-capacity because its driver and OCR runtime may reserve different memory.
+The previous custom tune-once/freeze overlay and optional FP8-assistant loader
+are not included in this port. The assistant evaluated here is BF16.
+
+## Validation
+
+Production latency follow-up supersedes the original adaptive recommendation.
+In short arrival-paced proxy replays, 0.31 fixed-k4 reduced mean request latency
+from **2.65 to 1.80 seconds** in a normal window and **3.30 to 2.70 seconds**
+in a busy window, compared with the degraded adaptive production instance.
+Matched 0.26 fixed-k4 controls were **1.85 and 2.71 seconds**. A fresh adaptive
+instance achieved **1.72 and 2.11 seconds**; the underlying instance-specific
+cause is not established. Fixed-k4 is the conservative fallback while that
+instability is investigated. These are workload-specific performance tests, not a
+broad quality or statistical claim.
+The initial proxy export omitted structured response formats, thinking overrides
+and some `n:2` requests; see the request-fidelity correction in the validation
+notes. Those initial timings alone do not establish live production recovery.
+
+FlashInfer B12 X and cuDNN linear alternatives were slower than CUTLASS in the
+latest paired tests. FlashInfer attention failed warmup at the current memory
+budget; adaptive verification is also unsupported by that backend on SM120.
+The local admission patch remains useful for avoiding preemption under mixed
+output lengths. See [results and limitations](docs/validation-0.31.md).
+
+The final fixed-k4 re-verification of PR60317 and PR60689 retained this baseline.
+The query-only PR60689 backport improved one quiet replay by about 5%, but
+quick throughput gains were only about 0–2%; neither PR is included. All
+384 quick requests and 964 paced requests succeeded without preemption.
+The packaged 17-file overlay was rechecked against the selected production
+bundle on October 16 and is byte-identical.
 
 ## Repository contents
 
-- `overlay/`: exact runtime files installed into the official image;
-- `patches/`: nine-part review stack;
-- `tests/`: focused source-level regression tests;
-- `manifests/`: base compatibility and overlay integrity contracts;
-- `scripts/install-overlay.sh`: fail-closed runtime installer;
-- `scripts/build-release.sh`: deterministic release-asset builder; and
-- `docs/`: provenance and deployment notes.
+- `overlay/`: 17 exact runtime files installed into the pinned image.
+- `patches/`: reviewable runtime/test patch against the pinned source commit.
+- `tests/`: corresponding source regression tests.
+- `manifests/`: base compatibility and overlay integrity contracts.
+- `scripts/`: installer, source verifier, patch application and release builder.
+- `docs/`: deployment, provenance, measurements and historical OCR notes.
 
 No checkpoint, Hugging Face cache, prompts, corpus data, generated tactic map,
-or node secret is published here.
-
-
-## OCR deployment update
-
-The September 6, 2026 OCR bundle adds shared GPU workspace, cropped-line
-recognition, short-line profiles, and a fix for small/wide/tall full-page
-inputs. It is delivered through the existing Hugging Face OCR repository; the
-vLLM overlay release and startup gist remain compatible. See
-[deployment and validation details](docs/deployment.md#ocr-bundle-update-2026-09-06).
+or node secret is distributed. Historical OCR deployment details remain in
+[the deployment notes](docs/deployment.md#ocr-bundle-update-2026-09-06).

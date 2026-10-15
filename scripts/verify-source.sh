@@ -8,6 +8,7 @@ sha256sum --check manifests/overlay-files.sha256
 bash -n scripts/install-overlay.sh
 bash -n scripts/build-release.sh
 bash -n scripts/apply-patches.sh
+bash -n scripts/check-cpu.sh
 
 while IFS= read -r path; do
   [[ -f "overlay/${path}" ]] || {

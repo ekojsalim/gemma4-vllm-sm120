@@ -26,10 +26,18 @@ class _AttentionStub(torch.nn.Module):
         self.kv_sharing_target_layer_name = None
         self.calculate_kv_scales = False
 
+    def bind_kv_cache(self, cache):
+        self.kv_cache = cache
+
 
 @pytest.fixture(autouse=True)
 def _cpu_platform(monkeypatch):
     monkeypatch.setattr(worker_utils.current_platform, "is_cpu", lambda: True)
+    monkeypatch.setattr(
+        worker_utils.current_platform,
+        "check_runner_kv_caches_multi_layer",
+        lambda: None,
+    )
 
 
 def test_bind_kv_cache():
