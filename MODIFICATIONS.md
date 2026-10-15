@@ -10,7 +10,9 @@ small-query segmented Triton attention, transactional hybrid-KV admission,
 separate speculative admission, shared FP8 KV-scale ownership, the optional
 Q/probability-scale contract, and the draft single-query graph guard.
 
-Adaptive verification and FlashInfer autotuning use upstream 0.31 behavior.
+FlashInfer autotuning uses upstream 0.31 behavior. Adaptive verification is
+unmodified upstream code, but is disabled in the selected serving configuration
+following the production-latency regression.
 The old optional FP8 assistant loader and custom tune-once/freeze autotune
 implementation are excluded. PR60689/60317 experiments are not included.
 

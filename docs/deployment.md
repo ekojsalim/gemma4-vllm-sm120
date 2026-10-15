@@ -23,7 +23,7 @@ vllm serve /models/gemma4 \
   --enable-flashinfer-autotune --async-scheduling \
   --no-enable-prefix-caching --no-disable-hybrid-kv-cache-manager \
   --hybrid-kv-cache-admission --hybrid-kv-speculative-admission \
-  --speculative-config '{"method":"mtp","model":"/models/assistant","num_speculative_tokens":4,"enable_adaptive_verification":true}' \
+  --speculative-config '{"method":"mtp","model":"/models/assistant","num_speculative_tokens":4,"enable_adaptive_verification":false}' \
   --cudagraph-capture-sizes 1 2 4 8 16 24 32 40 48 56 64 \
   --attention-config '{"backend_per_kind":{"sliding_window":"TRITON_ATTN","full_attention":"TRITON_ATTN"}}' \
   --enable-auto-tool-choice --reasoning-parser gemma4 --tool-call-parser gemma4 \

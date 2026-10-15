@@ -2,7 +2,7 @@
 
 This repository packages the local runtime changes validated for a Gemma 4
 ModelOpt NVFP4 target with a BF16 Gemma 4 MTP assistant on one RTX 5090 (SM120).
-Overlay **0.2.0** targets **vLLM 0.31.0** and uses adaptive verification up to
+Overlay **0.2.0** targets **vLLM 0.31.0** and uses fixed verification of
 four draft tokens. It is an overlay for the official image, not a custom image.
 
 ```text
@@ -34,7 +34,8 @@ arguments, and cache handling together. The old 0.26 startup gist is not a
 
 ## Selected serving configuration
 
-- Adaptive MTP verification, maximum `num_speculative_tokens=4`.
+- Fixed MTP verification, `num_speculative_tokens=4` and
+  `enable_adaptive_verification=false`.
 - ModelOpt NVFP4 target, BF16 assistant, FP8 KV cache.
 - Triton sliding-window/full attention and FlashInfer CUTLASS linear kernels.
 - Upstream 0.31 FlashInfer autotuning and a persistent, version-isolated cache.
@@ -49,10 +50,15 @@ are not included in this port. The assistant evaluated here is BF16.
 
 ## Validation
 
-The promoted local service completed 64/64 replay requests at concurrency 24,
-with zero preemptions and approximately **1,285 output tokens/s**. Earlier
-matched 0.26 controls were approximately 864–881 tokens/s. This is a quick
-workload-specific comparison, not a broad quality or statistical claim.
+Production latency follow-up supersedes the original adaptive recommendation.
+In short arrival-paced proxy replays, 0.31 fixed-k4 reduced mean request latency
+from **2.65 to 1.80 seconds** in a normal window and **3.30 to 2.70 seconds**
+in a busy window, compared with the degraded adaptive production instance.
+Matched 0.26 fixed-k4 controls were **1.85 and 2.71 seconds**. A fresh adaptive
+instance achieved **1.72 and 2.11 seconds**; the underlying instance-specific
+cause is not established. Fixed-k4 is the conservative fallback while that
+instability is investigated. These are workload-specific performance tests, not a
+broad quality or statistical claim.
 
 FlashInfer B12 X and cuDNN linear alternatives were slower than CUTLASS in the
 latest paired tests. FlashInfer attention failed warmup at the current memory

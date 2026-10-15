@@ -6,6 +6,50 @@ Some requests use n>1, yielding 68 generated sequences. Timings exclude warmup.
 
 ## Selected configuration
 
+Use local patches, fixed-k4 verification, Triton attention and FlashInfer
+CUTLASS. The latency follow-up below supersedes the original adaptive selection.
+
+## Production latency follow-up
+
+The original saturated throughput test missed a production latency regression.
+We compared the actual degraded adaptive instance with 0.31 fixed-k4 and the
+old 0.26 fixed-k4 bundle, retaining the model checkpoints, explicit KV budget,
+and resident OCR/term services. The 0.31 variants retain the same 17 patches.
+
+| Configuration | Normal mean E2E | Busy mean E2E | Normal decode ms/output token | Busy decode ms/output token |
+|---|---:|---:|---:|---:|
+| 0.31 degraded adaptive instance | 2.646 s | 3.300 s | 13.42 | 13.63 |
+| 0.31 fixed-k4 | 1.797 s | 2.697 s | 8.55 | 10.42 |
+| 0.26 fixed-k4 | 1.847 s | 2.715 s | 8.56 | 10.52 |
+| 0.31 fresh adaptive instance | 1.717 s | 2.113 s | 8.10 | 8.25 |
+
+Each window is 120 seconds, containing 123 or 220 requests sent at recorded
+arrival offsets. All requests succeeded with zero preemptions. Payloads are
+task-matched proxies using a translation corpus and 45 private metadata/term
+samples; they are not the exact production conversations. Some trace token
+counts are missing. Outputs are not forced; aggregate output-token totals
+between degraded adaptive and 0.31 fixed differed by less than 0.5%.
+
+Separate 32-request screens at concurrency 1/2/4/8 showed comparable fixed-k4
+performance between 0.26 and 0.31. A fresh adaptive instance also recovered
+healthy low-concurrency performance and beat fixed-k4 on the busy replay.
+Fixed-k4 is selected as the conservative fallback, not the fastest observed
+short-run configuration. The cause of the degraded instance is unresolved.
+Startup calibration and request-history effects require further
+isolation; a healthy short restart test does not establish sustained behavior.
+A second adaptive startup using a copy of the production cache also recovered
+c4 performance (556 output tokens/s, 7.08 ms median TPOT). This short check
+does not reproduce the degradation from the cache alone.
+
+Adaptive verification may skip scheduled draft tokens that still enter the
+draft counter, so its reported acceptance is not a direct draft-quality metric.
+Server inter-token latency measures output-event gaps and can improve while
+time per delivered token worsens. Use client E2E, TTFT and TPOT alongside server
+decode time per output token. Short metadata tasks in the busy replay showed
+little improvement; most of the benefit was on translation.
+
+## Original saturated-throughput selection (superseded)
+
 Local patches + adaptive verification up to four tokens + Triton attention +
 FlashInfer CUTLASS gave approximately 1,293 output tokens/s at concurrency 24
 in the original comparison, against 864–881 for the matched production 0.26
