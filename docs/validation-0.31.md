@@ -11,6 +11,24 @@ CUTLASS. The latency follow-up below supersedes the original adaptive selection.
 
 ## Production latency follow-up
 
+**Request-fidelity correction:** the exporter subsequently confirmed that
+`sampling_parameters` omits the `json_schema` response format added to structured
+calls. The proxy replays below did not reproduce those grammar constraints.
+Healthy fresh-adaptive results do not rule out a live request-body/mix effect,
+and these tests alone do not establish recovered live production latency.
+
+A subsequent after-tuning proxy replay restored the exact application schema
+builders, `enable_thinking:false` for structured tasks, and `n:2` for the second
+non-streamed translation candidate. Across two 120-second windows (241 calls,
+56 structured calls, 25 n=2 calls), all calls succeeded with no preemptions.
+Overall speculative acceptance was 51.0%, versus approximately 20% reported
+from the degraded live instance. Per-task acceptance was 48.8% translation,
+50.5% self-selection, 80.1% terms, 89.7% page-title metadata and 94.3% opening
+metadata. Thus these samples did not reproduce a structured-task collapse.
+Per-request metrics attributed n=1 calls; the global counter residual was
+assigned to translation because all missing-metric calls were translation
+(25 n=2 calls and one streamed n=1 call). Prompt substitution remains a limit.
+
 The original saturated throughput test missed a production latency regression.
 We compared the actual degraded adaptive instance with 0.31 fixed-k4 and the
 old 0.26 fixed-k4 bundle, retaining the model checkpoints, explicit KV budget,

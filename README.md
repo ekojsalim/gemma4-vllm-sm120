@@ -59,6 +59,9 @@ instance achieved **1.72 and 2.11 seconds**; the underlying instance-specific
 cause is not established. Fixed-k4 is the conservative fallback while that
 instability is investigated. These are workload-specific performance tests, not a
 broad quality or statistical claim.
+The initial proxy export omitted structured response formats, thinking overrides
+and some `n:2` requests; see the request-fidelity correction in the validation
+notes. Those initial timings alone do not establish live production recovery.
 
 FlashInfer B12 X and cuDNN linear alternatives were slower than CUTLASS in the
 latest paired tests. FlashInfer attention failed warmup at the current memory
