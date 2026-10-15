@@ -1,8 +1,9 @@
 # Deploying overlay 0.2.0 / vLLM 0.31
 
 Use the image digest in the root README. Build/download the matching overlay
-asset, verify its SHA256, extract it, and run `scripts/install-overlay.sh`
-before any vLLM process starts. Use a fresh image; replacing a running server's
+asset (`make release` builds 0.31 by default), verify its SHA256, extract it, and run `scripts/install-overlay.sh`
+from the extracted archive root before any vLLM process starts. The source
+checkout installer requires bundle metadata supplied by the release builder. Use a fresh image; replacing a running server's
 files or upgrading an old patched 0.26 container in place is unsupported.
 
 Mount the target at `/models/gemma4` and BF16 assistant at `/models/assistant`.

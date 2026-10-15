@@ -6,7 +6,7 @@ venv=$(mktemp -d)
 trap 'rm -rf -- "$venv"' EXIT
 uv venv --system-site-packages "$venv"
 uv pip install --python "$venv/bin/python" pytest
-cd "$root"
+cd "$root/versions/vllm-0.31.0"
 uv run --no-project --python "$venv/bin/python" python -m pytest --noconftest -q \
   tests/model_executor/layers/test_attention.py \
   tests/quantization/test_kv_cache_scale_contract.py \

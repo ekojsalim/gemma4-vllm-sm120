@@ -1,0 +1,10 @@
+patch	direct_context_check
+0001-Fix-attention-selection-for-language-only-Gemma.patch	applies
+0002-Support-bounded-small-M-segmented-Triton-attention.patch	applies
+0003-Add-transactional-hybrid-KV-cache-admission.patch	conflicts
+0004-Share-FP8-KV-scale-ownership.patch	conflicts
+0005-Add-speculative-admission-module.patch	applies
+0006-Split-speculative-admission-and-graph-depth.patch	conflicts
+0007-Allow-optional-FP8-assistant-config.patch	applies
+0008-Add-node-local-immutable-NVFP4-autotune-profiles.patch	conflicts
+0009-Clarify-FP8-Q-and-probability-scale-contract.patch	applies

@@ -1,0 +1,745 @@
+From fe75868c69e9e743432101b5bd2c2d8a227bdd5b Mon Sep 17 00:00:00 2001
+From: "Eko J. Salim" <eko@ekojs.com>
+Date: Wed, 5 Aug 2026 14:50:50 +0700
+Subject: [PATCH 2/3] Support bounded small-M segmented Triton attention
+
+Assisted-by: OpenAI Codex
+---
+ .../test_triton_unified_attention.py          | 466 ++++++++++++++++++
+ vllm/v1/attention/backends/triton_attn.py     |  12 +-
+ .../attention/ops/triton_unified_attention.py | 113 ++++-
+ 3 files changed, 575 insertions(+), 16 deletions(-)
+
+diff --git a/tests/kernels/attention/test_triton_unified_attention.py b/tests/kernels/attention/test_triton_unified_attention.py
+index d3435ea66..c30906318 100644
+--- a/tests/kernels/attention/test_triton_unified_attention.py
++++ b/tests/kernels/attention/test_triton_unified_attention.py
+@@ -342,6 +342,472 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
+     )
+ 
+ 
++@pytest.mark.parametrize("query_len", [2, 3])
++@torch.inference_mode()
++def test_triton_swa_single_block_matches_sequential_rows(query_len: int) -> None:
++    """A small SWA query block must preserve sequential decode reductions."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    sliding_window = 64
++    context_len = 128 - query_len
++    seq_len = context_len + query_len
++    num_query_heads = 4
++    num_kv_heads = 2
++    head_size = 256
++    scale = head_size**-0.5
++
++    query = torch.ones(
++        query_len, num_query_heads, head_size, dtype=torch.bfloat16
++    )
++    key = -torch.rand(seq_len, num_kv_heads, head_size, dtype=torch.bfloat16)
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE).view(
++        -1, block_size, num_kv_heads, head_size
++    )
++    value_cache = (value / v_scale).to(FP8_DTYPE).view_as(key_cache)
++    block_table = torch.arange(
++        key_cache.shape[0], dtype=torch.int32
++    ).unsqueeze(0)
++    scale_shape = (1, num_kv_heads)
++    k_descale = torch.full(scale_shape, k_scale.item(), dtype=torch.float32)
++    v_descale = torch.full(scale_shape, v_scale.item(), dtype=torch.float32)
++
++    def run(q: torch.Tensor, length: int) -> torch.Tensor:
++        output = torch.empty_like(q)
++        unified_attention(
++            q=q,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=torch.tensor([0, len(q)], dtype=torch.int32),
++            max_seqlen_q=len(q),
++            seqused_k=torch.tensor([length], dtype=torch.int32),
++            max_seqlen_k=length,
++            softmax_scale=scale,
++            causal=True,
++            window_size=(sliding_window - 1, 0),
++            block_table=block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=k_descale,
++            v_descale=v_descale,
++            seq_threshold_3D=0,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(query, seq_len)
++    sequential_output = torch.cat(
++        [
++            run(query[row : row + 1], context_len + row + 1)
++            for row in range(query_len)
++        ]
++    )
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize(
++    ("head_size", "sliding_window", "context_len"),
++    [
++        (256, 1024, 254),
++        (256, 1024, 1022),
++        (512, None, 254),
++    ],
++)
++@pytest.mark.parametrize("query_len", [2, 3])
++@pytest.mark.parametrize("batch_size", [1, 4, 8])
++@torch.inference_mode()
++def test_triton_small_m_3d_matches_sequential_decode_rows(
++    head_size: int,
++    sliding_window: int | None,
++    context_len: int,
++    query_len: int,
++    batch_size: int,
++) -> None:
++    """Bounded 3D verification must reproduce each q=1 reduction."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    num_query_heads = 32
++    num_kv_heads = 16
++    seq_threshold_3d = 8
++    num_segments = 16
++    seq_len = context_len + query_len
++    blocks_per_seq = (seq_len + block_size - 1) // block_size
++    num_blocks = batch_size * blocks_per_seq
++    scale = head_size**-0.5
++
++    query = torch.randn(
++        batch_size * query_len,
++        num_query_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    key = torch.randn(
++        num_blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(num_blocks, dtype=torch.int32).view(
++        batch_size, blocks_per_seq
++    )
++    query_start = torch.arange(
++        0,
++        (batch_size + 1) * query_len,
++        query_len,
++        dtype=torch.int32,
++    )
++    seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32)
++    window_size = (
++        (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
++    )
++
++    scratch_tokens = seq_threshold_3d * 3
++    scratch_output = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        dtype=torch.float32,
++    )
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def run(
++        run_query: torch.Tensor,
++        run_query_start: torch.Tensor,
++        run_seq_lens: torch.Tensor,
++        run_block_table: torch.Tensor,
++        run_max_query_len: int,
++    ) -> torch.Tensor:
++        output = torch.empty_like(run_query)
++        num_run_seqs = len(run_seq_lens)
++        descale_shape = (num_run_seqs, num_kv_heads)
++        unified_attention(
++            q=run_query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=run_query_start,
++            max_seqlen_q=run_max_query_len,
++            seqused_k=run_seq_lens,
++            max_seqlen_k=int(run_seq_lens.max()),
++            softmax_scale=scale,
++            causal=True,
++            window_size=window_size,
++            block_table=run_block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=torch.full(
++                descale_shape, k_scale.item(), dtype=torch.float32
++            ),
++            v_descale=torch.full(
++                descale_shape, v_scale.item(), dtype=torch.float32
++            ),
++            seq_threshold_3D=seq_threshold_3d,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(
++        query,
++        query_start,
++        seq_lens,
++        block_table,
++        query_len,
++    )
++    sequential_rows = []
++    if batch_size > seq_threshold_3d:
++        for row in range(query_len):
++            sequential_rows.append(
++                run(
++                    query.reshape(
++                        batch_size,
++                        query_len,
++                        num_query_heads,
++                        head_size,
++                    )[:, row],
++                    torch.arange(batch_size + 1, dtype=torch.int32),
++                    torch.full(
++                        (batch_size,),
++                        context_len + row + 1,
++                        dtype=torch.int32,
++                    ),
++                    block_table,
++                    1,
++                )
++            )
++        sequential_output = torch.stack(sequential_rows, dim=1).flatten(0, 1)
++    else:
++        for sequence in range(batch_size):
++            sequence_start = sequence * query_len
++            for row in range(query_len):
++                sequential_rows.append(
++                    run(
++                        query[sequence_start + row : sequence_start + row + 1],
++                        torch.tensor([0, 1], dtype=torch.int32),
++                        torch.tensor([context_len + row + 1], dtype=torch.int32),
++                        block_table[sequence : sequence + 1],
++                        1,
++                    )
++                )
++        sequential_output = torch.cat(sequential_rows)
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@torch.inference_mode()
++def test_triton_small_m_uses_2d_above_sequence_threshold() -> None:
++    """Batch 9 must retain the established 2D q=1/q=3 geometry."""
++    test_triton_small_m_3d_matches_sequential_decode_rows(
++        head_size=256,
++        sliding_window=1024,
++        context_len=254,
++        query_len=3,
++        batch_size=9,
++    )
++
++
++@torch.inference_mode()
++def test_triton_small_m_3d_mixed_rows_and_segment_boundaries() -> None:
++    """Mixed q=1/2/3 rows keep their own segment and SWA tile geometry."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    block_size = 16
++    sliding_window = 1024
++    head_size = 256
++    num_query_heads = 32
++    num_kv_heads = 16
++    num_segments = 16
++    seq_threshold_3d = 8
++    query_lens = [1, 2, 3, 3, 2, 1]
++    # Includes an empty final segment, partial tiles, a tiles-per-segment
++    # transition, the 1,024-token boundary, and a later logical wrap.
++    context_lens = [14, 15, 254, 255, 1022, 2046]
++    seq_lens_list = [
++        context + query
++        for context, query in zip(context_lens, query_lens, strict=True)
++    ]
++    batch_size = len(query_lens)
++    max_blocks_per_seq = (
++        max(seq_lens_list) + block_size - 1
++    ) // block_size
++    num_blocks = batch_size * max_blocks_per_seq
++
++    query_start_list = [0]
++    for query_len in query_lens:
++        query_start_list.append(query_start_list[-1] + query_len)
++    query_start = torch.tensor(query_start_list, dtype=torch.int32)
++    query = torch.randn(
++        query_start_list[-1],
++        num_query_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    key = torch.randn(
++        num_blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(num_blocks, dtype=torch.int32).view(
++        batch_size, max_blocks_per_seq
++    )
++    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
++    scratch_tokens = seq_threshold_3d * 3
++    scratch_output = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(
++        scratch_tokens,
++        num_query_heads,
++        num_segments,
++        dtype=torch.float32,
++    )
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def run(
++        run_query: torch.Tensor,
++        run_query_start: torch.Tensor,
++        run_seq_lens: torch.Tensor,
++        run_block_table: torch.Tensor,
++        run_max_query_len: int,
++    ) -> torch.Tensor:
++        output = torch.empty_like(run_query)
++        descale_shape = (len(run_seq_lens), num_kv_heads)
++        unified_attention(
++            q=run_query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=run_query_start,
++            max_seqlen_q=run_max_query_len,
++            seqused_k=run_seq_lens,
++            max_seqlen_k=int(run_seq_lens.max()),
++            softmax_scale=head_size**-0.5,
++            causal=True,
++            window_size=(sliding_window - 1, 0),
++            block_table=run_block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=torch.full(
++                descale_shape, k_scale.item(), dtype=torch.float32
++            ),
++            v_descale=torch.full(
++                descale_shape, v_scale.item(), dtype=torch.float32
++            ),
++            seq_threshold_3D=seq_threshold_3d,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++        return output
++
++    block_output = run(query, query_start, seq_lens, block_table, 3)
++    sequential_rows = []
++    for sequence, (context_len, query_len) in enumerate(
++        zip(context_lens, query_lens, strict=True)
++    ):
++        sequence_start = query_start_list[sequence]
++        for row in range(query_len):
++            sequential_rows.append(
++                run(
++                    query[sequence_start + row : sequence_start + row + 1],
++                    torch.tensor([0, 1], dtype=torch.int32),
++                    torch.tensor([context_len + row + 1], dtype=torch.int32),
++                    block_table[sequence : sequence + 1],
++                    1,
++                )
++            )
++    sequential_output = torch.cat(sequential_rows)
++
++    torch.testing.assert_close(block_output, sequential_output, atol=0, rtol=0)
++
++
++@torch.inference_mode()
++def test_triton_small_m_3d_cuda_graph_matches_eager() -> None:
++    """The bounded q=3 segment buffers and launch geometry are graph-stable."""
++    torch.set_default_device(DEVICE_TYPE)
++    set_random_seed(0)
++
++    query_len = 3
++    context_len = 254
++    seq_len = context_len + query_len
++    block_size = 16
++    head_size = 256
++    num_query_heads = 32
++    num_kv_heads = 16
++    num_segments = 16
++    blocks = (seq_len + block_size - 1) // block_size
++    query = torch.randn(
++        query_len, num_query_heads, head_size, dtype=torch.bfloat16
++    )
++    key = torch.randn(
++        blocks,
++        block_size,
++        num_kv_heads,
++        head_size,
++        dtype=torch.bfloat16,
++    )
++    value = torch.randn_like(key)
++    k_scale = torch.tensor(0.5, dtype=torch.float32)
++    v_scale = torch.tensor(0.25, dtype=torch.float32)
++    key_cache = (key / k_scale).to(FP8_DTYPE)
++    value_cache = (value / v_scale).to(FP8_DTYPE)
++    block_table = torch.arange(blocks, dtype=torch.int32).unsqueeze(0)
++    query_start = torch.tensor([0, query_len], dtype=torch.int32)
++    seq_lens = torch.tensor([seq_len], dtype=torch.int32)
++    k_descale = torch.full((1, num_kv_heads), k_scale.item())
++    v_descale = torch.full((1, num_kv_heads), v_scale.item())
++    scratch_output = torch.empty(
++        8 * 3,
++        num_query_heads,
++        num_segments,
++        head_size,
++        dtype=torch.float32,
++    )
++    scratch_max = torch.empty(
++        8 * 3, num_query_heads, num_segments, dtype=torch.float32
++    )
++    scratch_expsum = torch.empty_like(scratch_max)
++
++    def launch(output: torch.Tensor) -> None:
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=query_start,
++            max_seqlen_q=query_len,
++            seqused_k=seq_lens,
++            max_seqlen_k=seq_len,
++            softmax_scale=head_size**-0.5,
++            causal=True,
++            window_size=(1023, 0),
++            block_table=block_table,
++            softcap=0,
++            q_descale=None,
++            k_descale=k_descale,
++            v_descale=v_descale,
++            seq_threshold_3D=8,
++            num_par_softmax_segments=num_segments,
++            softmax_segm_output=scratch_output,
++            softmax_segm_max=scratch_max,
++            softmax_segm_expsum=scratch_expsum,
++            kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
++        )
++
++    eager_output = torch.empty_like(query)
++    launch(eager_output)
++    torch.cuda.synchronize()
++    graph_output = torch.empty_like(query)
++    launch(graph_output)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        launch(graph_output)
++    graph.replay()
++    torch.cuda.synchronize()
++
++    torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
++
++
++
+ @pytest.mark.parametrize(
+     "seq_lens",
+     [
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 3f9b9ed0c..f8f2c89b2 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -40,7 +40,10 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+     triton_reshape_and_cache_flash,
+     triton_reshape_and_cache_flash_per_token_head_quant,
+ )
+-from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++from vllm.v1.attention.ops.triton_unified_attention import (
++    MAX_SMALL_M_3D_QUERY_LEN,
++    unified_attention,
++)
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+     KVQuantMode,
+@@ -153,9 +156,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
+         headdim_padded = next_power_of_2(self.headdim)
++        max_3d_tokens = self.seq_threshold_3D * MAX_SMALL_M_3D_QUERY_LEN
+         self.softmax_segm_output = torch.empty(
+             (
+-                self.seq_threshold_3D,
++                max_3d_tokens,
+                 self.num_heads_q,
+                 self.num_par_softmax_segments,
+                 headdim_padded,
+@@ -164,12 +168,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             device=device,
+         )
+         self.softmax_segm_max = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (max_3d_tokens, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.softmax_segm_expsum = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (max_3d_tokens, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ce4a85cfe..9dd1d6b4a 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import KVQuantMode
+ logger = init_logger(__name__)
+ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+ float8_info = torch.finfo(current_platform.fp8_dtype())
++MAX_SMALL_M_3D_QUERY_LEN = 3
+ 
+ 
+ @triton.jit
+@@ -243,6 +244,7 @@ def kernel_unified_attention(
+     # to ``[segm_idx, segm_idx+1) × tiles_per_segment`` and writes
+     # per-segment partials, finalized by ``reduce_segments``.
+     IS_3D: tl.constexpr,
++    ROW_EQUIVALENT_3D: tl.constexpr,
+     # Parameters below default to None so Triton can skip materialising them
+     # on call sites where the corresponding constexpr branch is dead.
+     # Credit: @quinnlp identified this as a perf regression source in
+@@ -319,12 +321,36 @@ def kernel_unified_attention(
+     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
+         return
+ 
++    context_len = seq_len - cur_batch_query_len
+     if IS_3D:
+-        tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
+-        if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
+-            return
++        if ROW_EQUIVALENT_3D:
++            q_block_first = q_block_local_idx * BLOCK_Q
++            q_block_last = tl.minimum(
++                q_block_first + BLOCK_Q, cur_batch_query_len
++            ) - 1
++            first_row_seq_len = context_len + q_block_first + 1
++            last_row_seq_len = context_len + q_block_last + 1
++            min_tiles_per_segment = cdiv_fn(
++                first_row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            max_tiles_per_segment = cdiv_fn(
++                last_row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            tiles_per_segment = max_tiles_per_segment
++            if segm_idx * min_tiles_per_segment * TILE_SIZE >= last_row_seq_len:
++                return
++        else:
++            tiles_per_segment = cdiv_fn(
++                seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            min_tiles_per_segment = tiles_per_segment
++            max_tiles_per_segment = tiles_per_segment
++            if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
++                return
+     else:
+         tiles_per_segment = 0
++        min_tiles_per_segment = 0
++        max_tiles_per_segment = 0
+ 
+     # Number of valid query rows in this block (used by TD descriptor
+     # shapes, but always computed so the variable stays in scope).
+@@ -386,8 +412,6 @@ def kernel_unified_attention(
+         score_scale = scale * tl.load(q_scale) * tl.load(k_scale)
+         value_scale = tl.load(v_scale)
+ 
+-    context_len = seq_len - cur_batch_query_len
+-
+     if USE_ALIBI_SLOPES:
+         alibi_slope = tl.load(
+             alibi_slopes_ptr + query_offset_1, mask=query_mask_1, other=0.0
+@@ -409,12 +433,15 @@ def kernel_unified_attention(
+         num_queries_per_kv,
+         SLIDING_WINDOW,
+         USE_MM_PREFIX or USE_R_SWA,
+-        IS_3D,
++        IS_3D and not ROW_EQUIVALENT_3D,
+         USE_CAUSAL,
+         USE_PER_SEQ_CAUSAL,
+         CHUNK_LOOKBACK,
+         CHUNK_SIZE,
+     )
++    if ROW_EQUIVALENT_3D:
++        loop_lo = tl.maximum(loop_lo, segm_idx * min_tiles_per_segment)
++        loop_hi = tl.minimum(loop_hi, (segm_idx + 1) * max_tiles_per_segment)
+ 
+     # iterate through tiles (now limited to the sliding window range)
+     for j in range(loop_lo, loop_hi):
+@@ -558,7 +585,48 @@ def kernel_unified_attention(
+                 qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+             )
+ 
++        M_prev = M
++        L_prev = L
+         M, L, P, alpha = softmax_step(S, M, L)
++        row_update_active = tl.full([BLOCK_M], True, dtype=tl.int1)
++        if ROW_EQUIVALENT_3D:
++            row_seq_len = context_len + query_pos + 1
++            row_tiles_per_segment = cdiv_fn(
++                row_seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE
++            )
++            row_segment_start = segm_idx * row_tiles_per_segment
++            row_segment_end = (segm_idx + 1) * row_tiles_per_segment
++            row_update_active &= (
++                (j >= row_segment_start)
++                & (j < row_segment_end)
++                & (row_segment_start * TILE_SIZE < row_seq_len)
++            )
++        # The loop bounds cover the union of rows in a query block. Preserve
++        # each row's sequential SWA tile range for a single query block.
++        if (
++            SLIDING_WINDOW > 0
++            and not USE_MM_PREFIX
++            and not USE_R_SWA
++            and CHUNK_LOOKBACK < 0
++        ):
++            query_abs_pos_1d = context_len + query_pos
++            row_first_key = query_abs_pos_1d - SLIDING_WINDOW + 1
++            row_tile_start = tl.maximum(0, row_first_key // TILE_SIZE)
++            row_tile_end = query_abs_pos_1d // TILE_SIZE + 1
++            row_tile_active = (cur_batch_query_len > BLOCK_Q) | (
++                (j >= row_tile_start) & (j < row_tile_end)
++            )
++            row_update_active &= row_tile_active
++        if ROW_EQUIVALENT_3D or (
++            SLIDING_WINDOW > 0
++            and not USE_MM_PREFIX
++            and not USE_R_SWA
++            and CHUNK_LOOKBACK < 0
++        ):
++            M = tl.where(row_update_active, M, M_prev)
++            L = tl.where(row_update_active, L, L_prev)
++            P = tl.where(row_update_active[:, None], P, 0.0)
++            alpha = tl.where(row_update_active, alpha, 1.0)
+         acc = acc * alpha[:, None]
+ 
+         if SLIDING_WINDOW:
+@@ -702,6 +770,7 @@ def reduce_segments(
+     BLOCK_Q: tl.constexpr,  # int
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    ROW_EQUIVALENT_3D: tl.constexpr,
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -715,6 +784,13 @@ def reduce_segments(
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
+ 
++    if ROW_EQUIVALENT_3D:
++        query_start = tl.load(query_start_len_ptr + seq_idx)
++        query_end = tl.load(query_start_len_ptr + seq_idx + 1)
++        query_len = query_end - query_start
++        query_pos = query_token_idx - query_start
++        seq_len = seq_len - query_len + query_pos + 1
++
+     # number of segments for this particular sequence
+     num_segments = NUM_SEGMENTS_PER_SEQ
+     tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+@@ -1033,21 +1109,32 @@ def unified_attention(
+             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
+         )
+ 
+-    # Launch the 2D kernel if
+-    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+-    # 2. The batch includes at least one prefill request, or
+-    # 3. The number of sequences exceeds the configured threshold, or
+-    # 4. Batch invariance is enabled
++    # Use the segmented path only for bounded small-M requests whose rows fit
++    # in the fixed scratch buffers. Larger prefills retain the 2D path.
++    bounded_3d_query = max_seqlen_q <= MAX_SMALL_M_3D_QUERY_LEN
++    segment_capacity = (
++        min(
++            softmax_segm_output.shape[0],
++            softmax_segm_max.shape[0],
++            softmax_segm_expsum.shape[0],
++        )
++        if softmax_segm_output is not None
++        and softmax_segm_max is not None
++        and softmax_segm_expsum is not None
++        else 0
++    )
+     use_3d = not (
+         seq_threshold_3D is None
+         or num_par_softmax_segments is None
+         or softmax_segm_output is None
+         or softmax_segm_max is None
+         or softmax_segm_expsum is None
+-        or max_seqlen_q > 1
++        or not bounded_3d_query
++        or q.shape[0] > segment_capacity
+         or num_seqs > seq_threshold_3D
+         or is_batch_invariant
+     )
++    row_equivalent_3d = use_3d and max_seqlen_q > 1
+ 
+     # The kernel signature is the same for 2D and 3D — only the launch
+     # grid + a handful of constexpr toggles differ.  Per-token-head scale
+@@ -1156,6 +1243,7 @@ def unified_attention(
+         NUM_SEGMENTS_PER_SEQ=num_segments,
+         USE_FP8=output_scale is not None,
+         IS_3D=use_3d,
++        ROW_EQUIVALENT_3D=row_equivalent_3d,
+         KV_QUANT_MODE=kv_quant_mode,
+         Q_IS_FP8=(q.dtype == current_platform.fp8_dtype()),
+         CHUNK_LOOKBACK=chunk_lookback,
+@@ -1186,4 +1274,5 @@ def unified_attention(
+             BLOCK_Q=BLOCK_Q,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
+             USE_FP8=output_scale is not None,
++            ROW_EQUIVALENT_3D=row_equivalent_3d,
+         )
+-- 
+2.54.0
+

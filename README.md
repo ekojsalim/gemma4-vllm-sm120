@@ -15,7 +15,8 @@ overlay over an already-patched 0.26 environment.
 
 ## Deployment contract
 
-Build with `bash scripts/build-release.sh`. Install the asset in a fresh pinned
+Build with `make release` (defaults to `versions/vllm-0.31.0`). Extract the
+resulting archive and install from its root in a fresh pinned
 image **before importing or starting vLLM**:
 
 ```bash
@@ -78,13 +79,23 @@ bundle on October 16 and is byte-identical.
 
 ## Repository contents
 
-- `overlay/`: 17 exact runtime files installed into the pinned image.
-- `patches/`: reviewable runtime/test patch against the pinned source commit.
-- `tests/`: corresponding source regression tests.
-- `manifests/`: base compatibility and overlay integrity contracts.
+- `versions/vllm-0.31.0/`: selected bundle, with 17 runtime files, review patch,
+  regression tests, manifests and pinned release metadata.
+- `versions/vllm-0.26.0/`: historical control; runtime bytes are preserved.
+- `compatibility/`: historical audits, including non-deployable 0.27 findings.
 - `scripts/`: installer, source verifier, patch application and release builder.
 - `docs/`: deployment, provenance, measurements and historical OCR notes.
 
 No checkpoint, Hugging Face cache, prompts, corpus data, generated tactic map,
 or node secret is distributed. Historical OCR deployment details remain in
 [the deployment notes](docs/deployment.md#ocr-bundle-update-2026-09-06).
+
+## Versioned tooling
+
+`make verify` and `make release` select vLLM 0.31.0. To verify/build the
+historical control, pass `VERSION_DIR=versions/vllm-0.26.0`. Its rebuilt archive
+uses overlay version 0.1.1; the selected 0.31 archive uses 0.2.0. Published
+0.1.0 assets and tags are unchanged. Local builds do not publish releases.
+
+Apply source patches with `bash scripts/apply-patches.sh CLEAN_CHECKOUT`
+(optionally followed by a version directory). See [upgrade procedure](docs/upgrading.md).

@@ -1,0 +1,182 @@
+diff --git a/vllm/v1/core/speculative_admission.py b/vllm/v1/core/speculative_admission.py
+new file mode 100644
+index 000000000..bb580e44b
+--- /dev/null
++++ b/vllm/v1/core/speculative_admission.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Speculative policy and transaction metadata over hybrid KV admission."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from vllm.v1.core.kv_admission import (
++    AdmissionReservation,
++    HybridKVAdmissionLedger,
++)
++
++
++def select_graph_aware_speculative_depth(
++    *,
++    candidate_count: int,
++    depth_lookup: list[int],
++    max_graph_tokens: int,
++) -> tuple[int, int]:
++    """Return the configured depth and graph-bounded batch membership."""
++    if candidate_count <= 0:
++        raise ValueError("candidate_count must be positive")
++    if candidate_count >= len(depth_lookup):
++        raise ValueError("candidate_count exceeds the bounded depth lookup")
++    selected_k = depth_lookup[candidate_count]
++    if selected_k not in (2, 3, 4):
++        raise ValueError(f"unsupported dynamic MTP depth k={selected_k}")
++    if max_graph_tokens <= 0:
++        return selected_k, candidate_count
++    member_limit = max(1, max_graph_tokens // (selected_k + 1))
++    return selected_k, min(candidate_count, member_limit)
++
++
++def speculative_depth_fallbacks(selected_k: int) -> tuple[int, ...]:
++    """Depth-first liveness order ending in one target-only operation."""
++    if selected_k not in (2, 3, 4):
++        raise ValueError(f"unsupported dynamic MTP depth k={selected_k}")
++    return tuple(k for k in (4, 3, 2) if k <= selected_k) + (0,)
++
++
++def validate_hybrid_mtp_admission(
++    *,
++    speculative_method: str | None,
++    num_spec_tokens: int,
++    use_eagle: bool,
++    num_lookahead_tokens: int,
++    dynamic_speculation: bool,
++    model_type: str | None,
++    architectures: tuple[str, ...] | list[str],
++    dynamic_speculative_depths: tuple[int, ...] | list[int] = (),
++) -> None:
++    """Fail closed outside bounded Gemma 4 MTP configurations."""
++    if speculative_method != "mtp" or not use_eagle:
++        raise ValueError(
++            "MTP hybrid admission supports only the built-in MTP method"
++        )
++    if num_spec_tokens < 1 or num_lookahead_tokens != num_spec_tokens:
++        raise ValueError(
++            "MTP hybrid admission requires bounded speculation with matching "
++            "maximum lookahead"
++        )
++    if dynamic_speculation:
++        depths = set(dynamic_speculative_depths)
++        if num_spec_tokens != 4 or not depths or not depths.issubset({2, 3, 4}):
++            raise ValueError(
++                "dynamic MTP hybrid admission supports only max k=4 with a "
++                "bounded k=2/3/4 schedule"
++            )
++    if model_type not in ("gemma4", "gemma4_text") or (
++        "Gemma4ForConditionalGeneration" not in architectures
++    ):
++        raise ValueError("MTP hybrid admission supports only Gemma 4")
++
++
++@dataclass(frozen=True)
++class SpeculativeBatchContract:
++    batch_id: int
++    selected_k: int
++    lookahead_tokens: int
++    request_ids: tuple[str, ...]
++    completion_epoch: int
++
++
++class SpeculativeAdmissionOverlay:
++    """Bind immutable speculative execution metadata to generic KV credits."""
++
++    def __init__(self, ledger: HybridKVAdmissionLedger) -> None:
++        self.ledger = ledger
++        self._contracts: dict[int, SpeculativeBatchContract] = {}
++
++    def batch_contract(self, batch_id: int) -> SpeculativeBatchContract:
++        try:
++            return self._contracts[batch_id]
++        except KeyError:
++            raise KeyError(batch_id) from None
++
++    def try_reserve(
++        self,
++        *,
++        batch_id: int,
++        request_id: str,
++        persistent_blocks: int,
++        physical_blocks: int,
++        physical_upper_bound: int,
++        selected_k: int,
++        lookahead_tokens: int,
++        completion_epoch: int,
++    ) -> AdmissionReservation | None:
++        if selected_k < 0 or lookahead_tokens < selected_k:
++            raise ValueError("invalid speculative batch contract")
++        if completion_epoch <= 0:
++            raise ValueError("completion_epoch must be positive")
++        contract = self._contracts.get(batch_id)
++        if contract is not None and (
++            contract.selected_k != selected_k
++            or contract.lookahead_tokens != lookahead_tokens
++            or contract.completion_epoch != completion_epoch
++        ):
++            raise ValueError(f"inconsistent contract for batch {batch_id}")
++
++        reservation = self.ledger.try_reserve(
++            batch_id=batch_id,
++            request_id=request_id,
++            persistent_blocks=persistent_blocks,
++            physical_blocks=physical_blocks,
++            physical_upper_bound=physical_upper_bound,
++        )
++        if reservation is None:
++            return None
++        request_ids = contract.request_ids if contract is not None else ()
++        self._contracts[batch_id] = SpeculativeBatchContract(
++            batch_id=batch_id,
++            selected_k=selected_k,
++            lookahead_tokens=lookahead_tokens,
++            request_ids=(*request_ids, request_id),
++            completion_epoch=completion_epoch,
++        )
++        return reservation
++
++    def rollback(self, reservation: AdmissionReservation) -> None:
++        contract = self.batch_contract(reservation.batch_id)
++        self.ledger.rollback(reservation)
++        request_ids = tuple(
++            request_id
++            for request_id in contract.request_ids
++            if request_id != reservation.request_id
++        )
++        if request_ids:
++            self._contracts[reservation.batch_id] = SpeculativeBatchContract(
++                batch_id=contract.batch_id,
++                selected_k=contract.selected_k,
++                lookahead_tokens=contract.lookahead_tokens,
++                request_ids=request_ids,
++                completion_epoch=contract.completion_epoch,
++            )
++        else:
++            del self._contracts[reservation.batch_id]
++
++    def settle_batch(
++        self,
++        batch_id: int,
++        physical_blocks: dict[str, int],
++        persistent_blocks: dict[str, int],
++        completion_epoch: int,
++    ) -> None:
++        contract = self.batch_contract(batch_id)
++        if completion_epoch != contract.completion_epoch:
++            raise ValueError(
++                f"stale completion epoch {completion_epoch}; "
++                f"expected {contract.completion_epoch}"
++            )
++        if tuple(self.ledger.batch_request_bounds(batch_id)) != contract.request_ids:
++            raise RuntimeError("speculative membership differs from KV reservation")
++        self.ledger.settle_batch(batch_id, physical_blocks, persistent_blocks)
++        del self._contracts[batch_id]

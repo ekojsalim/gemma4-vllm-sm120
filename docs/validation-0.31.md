@@ -197,3 +197,17 @@ from a source checkout. Fresh installation, byte-identical reinstallation, and
 rejection of a modified runtime file were checked in a disposable container.
 Applying the review patch to a clean source index reproduced all 17 overlay
 files byte-for-byte. Release archive generation was checked for determinism.
+
+## Versioned packaging integration — October 16
+
+The selected bundle now lives under `versions/vllm-0.31.0/`; build and verify
+commands default to it. Historical 0.26 runtime bytes are retained separately,
+with rebuilt packaging version 0.1.1 to avoid colliding with 0.31's 0.2.0 archive.
+Existing published release assets remain unchanged.
+
+Both bundles passed manifest checks, deterministic archive rebuilds, and fresh
+installation/reinstallation in their respective pinned images without GPU
+access. The 0.31 installer rejected a deliberately modified runtime file.
+The 0.31 review patch again reproduced all 17 overlay files from its clean base.
+The relocated 0.31 CPU test suite passed all 70 focused tests in the pinned
+image after installing the rebuilt archive. Runtime overlay bytes are unchanged.

@@ -1,0 +1,26 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: [vllm-0.26.0, vllm-0.31.0]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify versioned bundle
+        run: make verify VERSION_DIR=versions/${{ matrix.version }}
+      - name: Build deterministic release candidate
+        run: make release VERSION_DIR=versions/${{ matrix.version }}
+      - name: Verify deterministic archive
+        run: |
+          sha256sum dist/*.tar.gz > /tmp/archive.sha256
+          make release VERSION_DIR=versions/${{ matrix.version }}
+          sha256sum --check /tmp/archive.sha256

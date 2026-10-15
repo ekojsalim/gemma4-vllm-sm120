@@ -7,4 +7,3 @@ Version 2.0. The upstream project is https://github.com/vllm-project/vllm.
 
 The modifications and their provenance are described in MODIFICATIONS.md and
 the reviewable patch series under patches/.
-

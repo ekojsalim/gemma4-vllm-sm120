@@ -15,4 +15,5 @@ from the source checkout. Overlay bytes match the deployed local 0.31 bundle.
 The review patch includes both runtime modifications and corresponding tests.
 No generated autotune cache is distributed; upstream 0.31 creates node-local
 cache entries. The historical 0.26 release and its profile lifecycle remain
-available in the repository history and existing 0.1.0 release.
+available in `versions/vllm-0.26.0/` and the existing 0.1.0 release.
+The historical rebuild uses packaging version 0.1.1; its runtime is unchanged.
