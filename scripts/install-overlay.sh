@@ -32,7 +32,7 @@ die() {
   die "VERSION and release.env disagree"
 
 installed_version=$(
-  python3 -c 'from importlib.metadata import version; print(version("vllm"))'
+  uv run --no-project --python "${VLLM_PYTHON:-/usr/bin/python3}" python -c 'from importlib.metadata import version; print(version("vllm"))'
 )
 [[ "${installed_version}" == "${VLLM_VERSION}" ]] || \
   die "expected vLLM ${VLLM_VERSION}, found ${installed_version}"

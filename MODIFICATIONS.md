@@ -1,23 +1,6 @@
-# Modified vLLM files
+# Runtime modifications
 
-Each directory under `versions/` is an independently validated derivative of a
-specific vLLM base. Its `manifests/runtime-files.txt` lists every modified or
-new runtime file, and its `patches/` directory records the reviewable changes.
-
-The vLLM 0.26 bundle provides:
-
-- language-only Gemma 4 attention selection;
-- bounded small-M segmented Triton attention;
-- transactional hybrid-KV admission and a separate speculative overlay;
-- shared FP8 KV-scale ownership;
-- bounded graph-aware speculative-depth integration;
-- optional assistant FP8 configuration;
-- node-local tune-once/freeze FlashInfer NVFP4 profiles; and
-- corrected optional Q/probability-scale handling and warnings.
-
-These modifications are not assumed to apply to another vLLM release. See the
-corresponding compatibility assessment before porting them.
-
-No bundle contains model weights, tokenizer files, prompts, benchmark corpora,
-generated tactic profiles, private deployment paths, or credentials.
-
+Each version bundle has its own runtime manifest, overlay and review patches.
+See [0.31 modifications](versions/vllm-0.31.0/MODIFICATIONS.md) for the selected
+production bundle, or [0.26 modifications](versions/vllm-0.26.0/MODIFICATIONS.md)
+for the historical control. Runtime files are never shared between versions.

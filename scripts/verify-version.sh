@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-version_arg=${1:-versions/vllm-0.26.0}
+version_arg=${1:-versions/vllm-0.31.0}
 version_dir=$(realpath "${root}/${version_arg}")
 
 case "${version_dir}" in
@@ -21,7 +21,6 @@ source "${version_dir}/release.env"
 : "${VLLM_VERSION:?}"
 : "${VLLM_IMAGE_REF:?}"
 : "${VLLM_IMAGE_DIGEST:?}"
-: "${VLLM_BUILD_COMMIT:?}"
 : "${PATCH_BASE_COMMIT:?}"
 : "${PATCH_MAIL_COUNT:?}"
 : "${PYTHON_SITE_PACKAGES:?}"

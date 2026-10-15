@@ -8,7 +8,7 @@ fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 checkout=$(realpath "$1")
-version_arg=${2:-versions/vllm-0.26.0}
+version_arg=${2:-versions/vllm-0.31.0}
 version_dir=$(realpath "${root}/${version_arg}")
 
 case "${version_dir}" in
@@ -36,7 +36,9 @@ mapfile -t patch_files < <(
 )
 [[ "${#patch_files[@]}" -gt "${PATCH_MAIL_COUNT}" ]]
 
-git -C "${checkout}" am "${patch_files[@]:0:PATCH_MAIL_COUNT}"
+if (( PATCH_MAIL_COUNT > 0 )); then
+  git -C "${checkout}" am "${patch_files[@]:0:PATCH_MAIL_COUNT}"
+fi
 git -C "${checkout}" apply "${patch_files[@]:PATCH_MAIL_COUNT}"
 
 printf 'patch stack applied; review and commit non-mail patches\n'

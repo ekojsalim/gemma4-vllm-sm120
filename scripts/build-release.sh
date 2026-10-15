@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-version_arg=${1:-versions/vllm-0.26.0}
+version_arg=${1:-versions/vllm-0.31.0}
 version_dir=$(realpath "${root}/${version_arg}")
 
 case "${version_dir}" in
@@ -37,12 +37,18 @@ trap 'rm -rf -- "${stage}"' EXIT
 
 mkdir -p "${dist}" "${stage}/${name}/manifests" "${stage}/${name}/scripts"
 cp -a "${version_dir}/overlay" "${stage}/${name}/"
-cp "${root}/LICENSE" "${root}/NOTICE" "${root}/MODIFICATIONS.md" \
+cp "${root}/LICENSE" "${root}/NOTICE" "${version_dir}/MODIFICATIONS.md" \
   "${version_dir}/VERSION" "${version_dir}/release.env" "${stage}/${name}/"
 cp "${version_dir}/manifests/base-files.sha256" \
   "${version_dir}/manifests/overlay-files.sha256" \
   "${version_dir}/manifests/runtime-files.txt" "${stage}/${name}/manifests/"
 cp "${root}/scripts/install-overlay.sh" "${stage}/${name}/scripts/"
+cp "${version_dir}/README.md" "${stage}/${name}/README.md"
+if [[ "${VLLM_VERSION}" == 0.31.0 ]]; then
+  cp "${root}/README.md" "${stage}/${name}/README.md"
+  mkdir -p "${stage}/${name}/docs"
+  cp "${root}"/docs/{deployment.md,provenance.md,validation-0.31.md,ocr-bundle.json,upgrading.md} "${stage}/${name}/docs/"
+fi
 
 archive="${dist}/${name}.tar.gz"
 tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \

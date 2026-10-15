@@ -8,7 +8,7 @@ fi
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 checkout=$(realpath "$1")
-version_arg=${2:-versions/vllm-0.26.0}
+version_arg=${2:-versions/vllm-0.31.0}
 version_dir=$(realpath "${root}/${version_arg}")
 
 git -C "${checkout}" rev-parse --verify HEAD >/dev/null

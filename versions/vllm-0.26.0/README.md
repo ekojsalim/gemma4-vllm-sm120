@@ -1,9 +1,9 @@
 # vLLM 0.26.0 compatibility bundle
 
-Status: validated production control.
+Status: historical validated control; not the default configuration.
 
 The overlay files are byte-identical to release `v0.1.0` and the preserved
-production deployment. Bundle version `0.2.0` changes only repository/release
+production deployment. Bundle version `0.1.1` changes only repository/release
 organization and the generic installer metadata; it does not change runtime
 Python bytes.
 
@@ -14,3 +14,6 @@ the base manifest.
 
 The accepted historical FlashInfer tactic table is intentionally absent. A node
 generates and freezes a complete local profile before readiness.
+
+The 0.1.1 archive is a rebuilt packaging candidate, not the published 0.1.0
+asset. Existing tags and assets are unchanged.
