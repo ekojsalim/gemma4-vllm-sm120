@@ -36,6 +36,11 @@ recheck available memory. Keep companion services resident during validation.
 Wait for `/health`, then test text generation and companion services. Cold
 compilation/autotuning can take several minutes.
 
+Prefix caching is disabled because the current local admission implementation
+only supports that mode and explicitly rejects caching. Do not enable it
+while retaining these admission flags. Shared-prefix accounting would require
+an additional implementation and validation; it is not included in this release.
+
 0.31 uses its upstream FlashInfer autotune cache. Remove old startup checks
 that wait for a custom frozen-profile marker; the old
 `VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR` overlay contract does not apply here.

@@ -115,8 +115,71 @@ throughput result was obtained. Lower KV budgets and mixed backend variants
 were not tested. FlashInfer adaptive verification requires its SM100-family
 path and is unsupported on the 5090 in this version.
 
-PR60689 MTP fusion and PR60317 attention experiments showed no clear benefit
-in the earlier comparison and are excluded from this release.
+## Fixed-k4 Gemma PR re-verification
+
+The October 15 follow-up retained the selected fixed-k4 configuration and
+compared the local baseline with PR60317, PR60689's head changes, and a
+PR60689 head plus query-only backport. No candidate was promoted.
+
+| Candidate | c1 / c4 / c8 output tok/s | Evening mean E2E | Quiet mean E2E |
+|---|---:|---:|---:|
+| Selected baseline | 164.5 / 499.1 / 829.7 | 2.194 s | 2.965 s |
+| PR60317 | 162.5 / 495.0 / 827.7 | 2.230 s | 2.960 s |
+| PR60689 head only | 163.5 / 495.2 / 803.9 | 2.197 s | 3.061 s |
+| PR60689 head + query only | 166.8 / 500.7 / 842.9 | 2.139 s | 2.810 s |
+
+Each candidate ran 32 measured requests at concurrency 1, 4 and 8 after
+warmup, followed by 241 calls across two 120-second arrival-paced windows.
+The replay included strict per-task JSON schemas, thinking overrides, Nova
+`n:2` calls and streaming options. Translation and self-selection prompts
+remained proxies. All 384 quick requests and 964 paced requests succeeded,
+with no recorded preemptions. Paced acceptance was 51.4%, 51.5%, 52.0% and
+51.4% respectively. These are short single-pass comparisons, not a soak or
+quality evaluation.
+
+PR60317 offered no useful latency gain, although sampled total GPU use fell
+by 142 MiB. Head-only changes were flat. Query-only changes improved quiet
+mean latency by about 5.2%, with only about 0–2% quick throughput gains.
+Evening output lengths were also shorter (313.3 versus 319.4 tokens on
+average), so its 2.5% E2E reduction is not an equivalent-work speedup.
+The evidence does not establish a broad production improvement.
+
+Pinned trial revisions and scope:
+
+- [PR60317](https://github.com/vllm-project/vllm/pull/60317):
+  `b6e9de5607e167e3cd4e4688414ed4ce0e843e0b`, using the existing 0.31 port
+  and its prior 24-case GPU kernel checks. It replaces the local small-query
+  attention optimization while retaining admission and KV patches.
+- [PR60689](https://github.com/vllm-project/vllm/pull/60689):
+  `972b5416882e9be2e1c34ae337dcdfbc487e6ce0`. The head subset enables dense
+  greedy top-token selection and sparse gather changes; the sparse path is
+  inactive for this assistant. The query-only trial additionally ports input
+  compaction and all-draft-step decode into 0.31's static-k graph machinery.
+  It excludes the later dynamic-k refactor and all relaxed-verification
+  changes. Target sampling and strict verification remain unchanged.
+
+Final focused GPU checks passed nine cases, including query-only mapping at
+the deployed hidden width, sparse maximum-score parity and dense-head checks.
+Three earlier sparse exact-token-ID failures were investigated as equal-score
+BF16 ties, not score mismatches. Basic output checks are not a quality gate.
+Only aggregate measurements are published; private replay records are excluded.
+
+## Adaptive verification investigation
+
+The issue search on October 15 found related upstream reports, but no confirmed
+explanation for our single-GPU Gemma regression:
+
+- [#54011](https://github.com/vllm-project/vllm/issues/54011): acceptance
+  collapse and hanging with tensor-parallel rank budget divergence on eight
+  GPUs; this is not the same deployment topology.
+- [#52057](https://github.com/vllm-project/vllm/issues/52057): startup cost
+  mismatch, context dependence and online profiling design concerns.
+- [#54046](https://github.com/vllm-project/vllm/issues/54046): impossible
+  tail profiling shapes; proposed fixes #54065/#54077 were unmerged when checked.
+
+These reports are investigation leads, not a root-cause diagnosis. Fixed-k4
+remains selected; healthy fresh adaptive runs do not establish sustained
+production behavior.
 
 ## Limits
 

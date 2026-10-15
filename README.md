@@ -69,9 +69,16 @@ budget; adaptive verification is also unsupported by that backend on SM120.
 The local admission patch remains useful for avoiding preemption under mixed
 output lengths. See [results and limitations](docs/validation-0.31.md).
 
+The final fixed-k4 re-verification of PR60317 and PR60689 retained this baseline.
+The query-only PR60689 backport improved one quiet replay by about 5%, but
+quick throughput gains were only about 0–2%; neither PR is included. All
+384 quick requests and 964 paced requests succeeded without preemption.
+The packaged 17-file overlay was rechecked against the selected production
+bundle on October 16 and is byte-identical.
+
 ## Repository contents
 
-- `overlay/`:17 exact runtime files installed into the pinned image.
+- `overlay/`: 17 exact runtime files installed into the pinned image.
 - `patches/`: reviewable runtime/test patch against the pinned source commit.
 - `tests/`: corresponding source regression tests.
 - `manifests/`: base compatibility and overlay integrity contracts.
