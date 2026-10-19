@@ -46,12 +46,30 @@ class Transactions:
         self._plans = {}
 
     def _fingerprint(self):
-        # Full metadata graph detects out-of-band publication, free-queue
-        # changes, touches and ABA reuse, not just transaction revision changes.
-        state = (self.life, self.extents, self.seen, self.inflight, self.main_tokens)
+        # Flat metadata avoids recursive serialization of the pool's doubly
+        # linked free list. Covers fields consumed by supported transactions.
+        life = self.life
+        pool = life.pool
+        managers = tuple((type(m).__name__, repr(m.kv_cache_spec),
+            m.kv_cache_group_id, m.block_size, m.admission_block_cap,
+            m.enable_caching, m.dcp_world_size, m.pcp_world_size,
+            tuple((rid, tuple(b.block_id for b in bs)) for rid,bs in m.req_to_blocks.items()),
+            tuple(m.num_cached_block.items()),
+            tuple((rid, idx, b.block_id) for rid,(idx,b) in m._partial_hit_reqs.items()),
+            tuple((a.block_id,b.block_id) for a,b in m._pending_cow_copies),
+            tuple(m.new_block_ids)) for m in life.managers)
+        state = (tuple((b.block_id,b.ref_cnt,b.block_hash,b.block_hash_num_tokens,b.is_null)
+                       for b in pool.blocks), tuple(pool.epochs.items()),
+                 tuple(b.block_id for b in pool.free_block_queue.get_all_free_blocks()),
+                 pool.enable_caching, managers, life.max_model_len, life.max_batches,
+                 tuple((bid,tuple((r.group_id,r.block.block_id,r.generation) for r in rs))
+                       for bid,rs in life._leases.items()),
+                 tuple(life._extras.items()), sorted(life._completed),
+                 sorted(life._deferred_requests), tuple(self.extents.items()),
+                 sorted(self.seen), tuple(self.inflight.items()), tuple(self.main_tokens.items()))
         return sha256(pickle.dumps(state, protocol=5)).digest()
 
-    def _apply(self, batch_id, steps, extra):
+    def _validate(self, batch_id, steps, extra):
         if batch_id in self.inflight or batch_id in self.life._leases:
             raise ValueError('batch already submitted')
         self.life._check_batch(batch_id)
@@ -82,18 +100,30 @@ class Transactions:
                 for m, ids in zip(ms, hits):
                     if len(ids) != (s.computed + m.block_size - 1) // m.block_size:
                         raise ValueError('hit list does not cover computed boundary')
-                    for bid in ids:
+                    skipped = m.get_num_skipped_tokens(s.computed) // m.block_size
+                    non_null = [i for i in ids if i != self.life.pool.null_block.block_id]
+                    if len(non_null) != len(set(non_null)):
+                        raise ValueError('duplicate physical hit within group')
+                    for index, bid in enumerate(ids):
                         if not 0 <= bid < len(self.life.pool.blocks):
                             raise ValueError('invalid hit block')
                         b = self.life.pool.blocks[bid]
+                        if b.is_null and index >= skipped:
+                            raise ValueError('null block in active hit window')
                         if not b.is_null:
                             if b.block_hash is None:
                                 raise ValueError('hit is not cached')
                             if get_group_id(b.block_hash) != m.kv_cache_group_id:
                                 raise ValueError('hit belongs to another cache group')
                 new.append((s, hits))
-                self.extents[s.request_id] = s.extent
-                self.seen.add(s.request_id)
+        return new
+
+    def _apply(self, batch_id, steps, extra):
+        new = self._validate(batch_id, steps, extra)
+        ms = self.life.managers
+        for s, _ in new:
+            self.extents[s.request_id] = s.extent
+            self.seen.add(s.request_id)
         # Protect EVERY hit before allocating, including other requests/groups.
         for s, hits in new:
             for m, ids in zip(ms, hits):

@@ -144,7 +144,7 @@ future hard obligations and explicit unallocated transient extras. Failed
 preparation leaves live tables, pool refs, epochs, reservations and free-queue
 order unchanged.
 
-Commit checks a complete metadata fingerprint and transaction revision before
+Commit checks a fingerprint of metadata used by supported operations and transaction revision before
 replaying the prepared operations on the live managers. Plans are single-use and
 belong to one controller. Changes outside the controller, even a free/reallocate
 cycle that leaves occupancy unchanged, invalidate a prepared plan. Commit-time
@@ -201,3 +201,65 @@ Transaction validation on 2026-10-19: all 50 pinned-image CPU tests passed,
 including 13 transaction tests. Host oracle tests passed with the three
 vLLM-dependent modules skipped as intended. No GPU or production service was
 used or changed.
+
+## Direct planner: no allocator cloning
+
+`direct_planner.py` now projects a batch without executing hypothetical manager
+mutations or inventing block IDs. It starts from the current physical ownership
+observation, then calculates per-request/group deltas:
+
+- Adopted idle hits are counted once globally, including when several siblings
+  use the same block. All groups' hits still must be protected before allocation.
+- Skipped SWA prefix entries are excluded; null placeholders retain logical table
+  positions without consuming capacity.
+- A partial hit reserves one private CoW destination and keeps its source
+  physically occupied until copy completion. The copied tail gives no shared
+  full-attention credit to the new request.
+- Newly allocated private blocks consume their owner's hard budget; growth beyond
+  the persistent cap or hard extent remains physically charged.
+- Existing in-flight extras and new unallocated extras are added once. Both
+  immediate free capacity and total occupancy-plus-obligations must fit.
+
+`DirectTransactions` uses this calculation for prepare and retains the same
+real-manager commit/completion path. The original shadow planner remains a
+small-pool test reference. The complete transaction suite runs against both.
+A seeded differential test covers 200 combinations of block size, SWA geometry,
+extra retention, active/idle prefixes, partial boundaries, fan-out, lookahead and
+capacity rejection. Accepted projections must equal the real shadow's charge;
+rejected shadows must also be rejected directly. Additional tests cover large
+pools and new hits containing reclaimed SWA null placeholders.
+
+The benchmark exposed a recursion-limit failure in pickling the pool's linked
+free list. Stale-plan checking now serializes a flat representation of the fields
+used by these supported transaction operations: physical refs/hashes/epochs,
+free-queue order, request tables, CoW state, manager geometry and lifecycle state.
+It does not claim to fence arbitrary unsupported vLLM subsystems. Allocator
+cloning itself still fails at the larger size, which is another reason the
+shadow path stays a small-fixture oracle.
+
+Synthetic CPU measurement, 4,096 pool blocks including null, 8 new siblings,
+512-token shared prefix, 20 samples after 3 warm-up iterations:
+
+| Path | Median |
+| --- | ---: |
+| Direct prepare including flat fingerprint | 2.264 ms |
+| Direct projection only | 1.271 ms |
+| Shadow prepare | Unavailable: deepcopy recursion limit |
+
+These are metadata costs, not inference measurements or a production speedup.
+The benchmark alternates measurement order. Reproduce with:
+
+```sh
+experiments/prefix_admission/run-vllm-cpu.sh /workspace/experiments/prefix_admission/benchmark_planner.py
+```
+
+The direct algorithm removes cloning but still scans pool/request metadata and
+uses a full flat fingerprint. Incremental occupancy/credit updates and mutation
+revision hooks are still needed to avoid those costs in a production scheduling
+loop. The actual vLLM Scheduler, publication timing and speculative rollback paths
+remain unwired; release manifests and deployment guards remain unchanged.
+
+Direct-planner validation on 2026-10-19: all 67 pinned-image CPU tests passed,
+including 200 seeded differential scenarios and the 4,096-block prepare/commit
+case. Host oracle tests passed with vLLM-dependent modules skipped. No GPU or
+production service was used or changed.

@@ -49,3 +49,9 @@ remaining scheduler and transaction-boundary limitations.
 stale-checked commit, hard reservations, allocated lookahead, explicit pending
 extras, ordered completion and cancellation. It is not the production scheduler
 or a performant admission planner. Its tests run in the same pinned-image suite.
+
+`direct_planner.py` replaces shadow allocation with direct capacity projection.
+The shared transaction suite and 200 seeded differential cases compare it with
+real shadow execution. Pool scans and a flat metadata fingerprint remain; this
+is not yet wired into vLLM's serving scheduler. The adapter document includes
+CPU timing and the remaining runtime work.
