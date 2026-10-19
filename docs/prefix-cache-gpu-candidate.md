@@ -5,6 +5,9 @@ Status: bounded GPU checks and the representative 666-request span replay passed
 structural checks; full replay time improved 2.18×. Application-level quality
 validation remains open. See [span replay results](results/span-prefix-replay-2026-10-19/README.md)
 and the [initial GPU results](results/prefix-cache-gpu-2026-10-19/README.md).
+The [historical c8 regression check](results/prefix-c8-regression-2026-10-19/README.md)
+also passed: median 925 tok/s baseline versus 932 cold / 940 warm candidate,
+with a first-use compilation outlier documented separately.
 Production baseline remains 0.2.0, fixed-k4, prefix caching disabled.
 
 ## Deliberately small implementation

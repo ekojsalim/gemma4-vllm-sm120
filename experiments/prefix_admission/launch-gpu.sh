@@ -6,7 +6,7 @@ variant=${1:?usage: launch-gpu.sh on|off}
 : "${TARGET:?}" "${ASSISTANT:?}" "${TRIAL_ROOT:?}" "${CHAT_TEMPLATE:?}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
 source "$root/versions/vllm-0.31.0/release.env"
-archive="$root/dist/gemma4-vllm-sm120-overlay-v${BUNDLE_VERSION}.tar.gz"
+archive=${OVERLAY_ARCHIVE:-"$root/dist/gemma4-vllm-sm120-overlay-v${BUNDLE_VERSION}.tar.gz"}
 [[ -f "$archive" ]]
 container="gemma4-prefix-gpu-$variant"
 if podman container exists "$container"; then
@@ -19,6 +19,7 @@ flag=--no-enable-prefix-caching
 podman run -d --name "$container" --device nvidia.com/gpu=all \
   --security-opt label=disable --network host --ipc host \
   -e HF_HUB_OFFLINE=1 -e HF_DATASETS_OFFLINE=1 \
+  -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}" \
   -e GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION=1 -e VLLM_USE_V2_MODEL_RUNNER=1 \
   -e VLLM_CACHE_ROOT=/eval-cache/vllm -e TRITON_CACHE_DIR=/eval-cache/triton \
   -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
