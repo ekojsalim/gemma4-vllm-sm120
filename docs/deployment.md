@@ -1,4 +1,4 @@
-# Deploying overlay 0.2.0 / vLLM 0.31
+# Deploying overlay 0.2.1 / vLLM 0.31
 
 Use the image digest in the root README. Build/download the matching overlay
 asset (`make release` builds 0.31 by default), verify its SHA256, extract it, and run `scripts/install-overlay.sh`
@@ -11,6 +11,7 @@ Use a persistent cache directory dedicated to 0.31, for example:
 
 ```bash
 export VLLM_USE_V2_MODEL_RUNNER=1
+export GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION=1
 export VLLM_CACHE_ROOT=/cache/vllm031
 export TRITON_CACHE_DIR=/cache/triton031
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -22,7 +23,7 @@ vllm serve /models/gemma4 \
   --limit-mm-per-prompt '{"image":0,"video":0,"audio":0}' \
   --language-model-only --linear-backend flashinfer_cutlass \
   --enable-flashinfer-autotune --async-scheduling \
-  --no-enable-prefix-caching --no-disable-hybrid-kv-cache-manager \
+  --enable-prefix-caching --no-disable-hybrid-kv-cache-manager \
   --hybrid-kv-cache-admission --hybrid-kv-speculative-admission \
   --speculative-config '{"method":"mtp","model":"/models/assistant","num_speculative_tokens":4,"enable_adaptive_verification":false}' \
   --cudagraph-capture-sizes 1 2 4 8 16 24 32 40 48 56 64 \
@@ -37,10 +38,24 @@ recheck available memory. Keep companion services resident during validation.
 Wait for `/health`, then test text generation and companion services. Cold
 compilation/autotuning can take several minutes.
 
-Prefix caching is disabled because the current local admission implementation
-only supports that mode and explicitly rejects caching. Do not enable it
-while retaining these admission flags. Shared-prefix accounting would require
-an additional implementation and validation; it is not included in this release.
+Prefix caching uses conservative full-block sharing: every request retains its
+hard prompt/output reservation and shared blocks do not grant extra admission
+credit. Keep the explicit opt-in above, fixed-k4, single-device execution and the
+tested full/SWA geometry. Partial hits fall back to cold prefill. The environment
+variable retains its historical name so existing guard behavior stays unchanged.
+
+Morphism's promoted chat-only profile uses a 9,506,652,160-byte KV budget. The
+smaller budget in this generic example reserves memory for companion services;
+it is not a reason to change an existing node's qualified budget. Warm a full
+representative c8 batch before returning traffic; a short greeting does not cover
+all sampling kernels. Do not enable development endpoints in production.
+
+Qualification: 666 span requests per mode, 416 measured c8 requests across
+baseline/candidate runs, CPU ledger tests and pressure/cancellation checks. See
+[span results](results/span-prefix-replay-2026-10-19/README.md) and
+[c8 regression check](results/prefix-c8-regression-2026-10-19/README.md).
+Rollback is the previous 0.2.0 image with prefix caching disabled and its original
+flags; retain the complete deployment image/config pair.
 
 0.31 uses its upstream FlashInfer autotune cache. Remove old startup checks
 that wait for a custom frozen-profile marker; the old

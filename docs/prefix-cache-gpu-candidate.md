@@ -1,6 +1,7 @@
 # Prefix-cache GPU qualification candidate
 
-Candidate: **0.2.1-prefix.2**, pinned vLLM 0.31 image from release.env.
+Promoted release: **0.2.1**, runtime byte-identical to tested **0.2.1-prefix.2**.
+Pinned vLLM 0.31 image from release.env.
 Status: bounded GPU checks and the representative 666-request span replay passed
 structural checks; full replay time improved 2.18×. Application-level quality
 validation remains open. See [span replay results](results/span-prefix-replay-2026-10-19/README.md)
@@ -8,7 +9,9 @@ and the [initial GPU results](results/prefix-cache-gpu-2026-10-19/README.md).
 The [historical c8 regression check](results/prefix-c8-regression-2026-10-19/README.md)
 also passed: median 925 tok/s baseline versus 932 cold / 940 warm candidate,
 with a first-use compilation outlier documented separately.
-Production baseline remains 0.2.0, fixed-k4, prefix caching disabled.
+Previous baseline/rollback: 0.2.0, fixed-k4, prefix caching disabled.
+Promotion retains fixed-k4 and enables conservative prefix reuse. Historical
+qualification records below describe their state at test time.
 
 ## Deliberately small implementation
 

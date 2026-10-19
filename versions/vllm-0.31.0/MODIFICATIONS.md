@@ -20,11 +20,10 @@ Only the pinned image and per-file contract in `manifests/base-files.sha256`
 are supported. No model weights, tokenizer files, prompts, benchmark corpora,
 tactic profiles, or private deployment configuration are included.
 
-## 0.2.1-prefix.2 candidate
+## 0.2.1 promotion
 
 `patches/0002-Experimental-conservative-prefix-admission.patch` adds opt-in
 full-block prefix reuse through the real scheduler, retaining per-request hard
 reservations without shared-capacity discounts. See the candidate document for
 supported geometry, CPU evidence and bounded GPU results. Translation quality
-and performance qualification remain open. This is not
-a production promotion. The allocator's block/reference ownership is unchanged.
+and performance qualification remain open. The promoted runtime is byte-identical to the qualified prefix.2 candidate. The allocator's block/reference ownership is unchanged.
