@@ -1,8 +1,10 @@
 # Prefix-cache GPU qualification candidate
 
 Candidate: **0.2.1-prefix.2**, pinned vLLM 0.31 image from release.env.
-Status: bounded GPU checks passed; translation quality/performance qualification remains open.
-See [GPU results](results/prefix-cache-gpu-2026-10-19/README.md).
+Status: bounded GPU checks and the representative 666-request span replay passed
+structural checks; full replay time improved 2.18×. Application-level quality
+validation remains open. See [span replay results](results/span-prefix-replay-2026-10-19/README.md)
+and the [initial GPU results](results/prefix-cache-gpu-2026-10-19/README.md).
 Production baseline remains 0.2.0, fixed-k4, prefix caching disabled.
 
 ## Deliberately small implementation

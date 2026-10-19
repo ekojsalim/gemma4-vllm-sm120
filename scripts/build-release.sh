@@ -49,7 +49,8 @@ if [[ "${VLLM_VERSION}" == 0.31.0 ]]; then
   mkdir -p "${stage}/${name}/docs"
   cp "${root}"/docs/{deployment.md,provenance.md,validation-0.31.md,prefix-cache-gpu-candidate.md,ocr-bundle.json,upgrading.md} "${stage}/${name}/docs/"
   mkdir -p "${stage}/${name}/docs/results"
-  cp -a "${root}/docs/results/prefix-cache-gpu-2026-10-19" "${stage}/${name}/docs/results/"
+  cp -a "${root}/docs/results/prefix-cache-gpu-2026-10-19" \
+    "${root}/docs/results/span-prefix-replay-2026-10-19" "${stage}/${name}/docs/results/"
 fi
 
 archive="${dist}/${name}.tar.gz"
