@@ -46,6 +46,7 @@ class Lifecycle:
         self.max_model_len = max_model_len
         self.max_batches = max_batches
         self._leases = {}
+        self._extras = {}
         self._completed = set()
         self._deferred_requests = set()
         # Validate all supported geometry before any lifecycle mutation.
@@ -93,6 +94,16 @@ class Lifecycle:
                 self._retain(batch_id, [(manager.kv_cache_group_id, b) for b in blocks])
         self._deferred_requests.add(request_id)
 
+    def reserve_extra(self, batch_id, blocks):
+        """Explicit unallocated transient bound; capacity is checked by planner."""
+        self._check_batch(batch_id)
+        if not isinstance(blocks, int) or blocks < 0:
+            raise ValueError('invalid transient reservation')
+        if batch_id in self._extras:
+            raise ValueError('transient reservation already set')
+        self._leases.setdefault(batch_id, [])
+        self._extras[batch_id] = blocks
+
     def observation(self, extents):
         leases = {}
         for bid, records in self._leases.items():
@@ -102,7 +113,7 @@ class Lifecycle:
                     raise ValueError('retained block was reused before completion')
                 leases[bid].append((r.group_id, r.block))
         return observe(self.managers, extents, self.max_model_len,
-                       self.pool.epochs, leases=leases)
+                       self.pool.epochs, leases=leases, extras=self._extras)
 
     def complete(self, batch_id, extents):
         """Validate all ownership before releasing exactly this fence's refs."""
@@ -115,4 +126,5 @@ class Lifecycle:
             raise ValueError('retained references were released outside lifecycle')
         self.pool.free_blocks([r.block for r in records])
         del self._leases[batch_id]
+        self._extras.pop(batch_id, None)
         self._completed.add(batch_id)

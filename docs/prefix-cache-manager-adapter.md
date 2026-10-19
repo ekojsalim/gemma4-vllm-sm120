@@ -132,3 +132,72 @@ Lifecycle validation on 2026-10-19: 37 pinned-image CPU tests passed, including
 8 lifecycle tests and 30 real-manager randomized schedules in addition to the
 prior oracle schedules. Host oracle tests and `git diff --check` passed. No GPU
 or production service was used or changed.
+
+## CPU scheduler transaction reference
+
+`experiments/prefix_admission/transactions.py` connects the real manager mutations
+and lifecycle helper through prepare/commit, ordered completion, cancellation and
+safe SWA reclamation. It remains a CPU reference harness, not vLLM Scheduler
+integration. Preparation copies allocator metadata and executes the proposed
+batch on that shadow. A successful prepare returns the resulting occupancy plus
+future hard obligations and explicit unallocated transient extras. Failed
+preparation leaves live tables, pool refs, epochs, reservations and free-queue
+order unchanged.
+
+Commit checks a complete metadata fingerprint and transaction revision before
+replaying the prepared operations on the live managers. Plans are single-use and
+belong to one controller. Changes outside the controller, even a free/reallocate
+cycle that leaves occupancy unchanged, invalidate a prepared plan. Commit-time
+allocator exceptions or shadow/live disagreement are fatal programming errors;
+there is no rollback of arbitrary partial live mutations. This is appropriate
+for a serialized CPU reference, not sufficient production failure handling.
+
+The transaction sequence is:
+
+1. Validate fixed hard extents, scheduled target extent, lookahead, batch identity
+   and cache-group ownership of supplied hits. Actual prefix matching remains
+   upstream's responsibility; block IDs are internal lookup results, not an API.
+2. Adopt all requests' hits across all groups before any new allocation can evict
+   an idle hit needed later in the batch.
+3. Allocate target and speculative slots through the real managers. Transfer
+   pending CoW refs to the submitted batch's completion fence.
+4. Check unique occupancy plus future per-group obligations plus explicitly
+   supplied unallocated transient reservations. Already allocated lookahead and
+   prefill storage are charged physically; do not add them again as extras.
+5. Commit only if the live state still matches the prepared baseline.
+
+Two batches may overlap. Cancellation detaches tables but transfers their refs
+to the last submitted batch using that request. The controller requires ordered
+worker completions, so that fence implies earlier accesses have also finished.
+SWA reclamation is allowed only when the request has no outstanding worker use
+and only through a processed-token boundary no later than the scheduled target
+extent. This is deliberately conservative; async rejected-token rollback and
+reclamation while older steps are in flight remain future runtime work.
+
+Tests include large-prefill rejection followed by smaller-chunk progress,
+lookahead exceeding hard extent, overlapping transient extras, multi-request
+atomic rejection, stale sibling plans, out-of-band allocation changes,
+wrong-group hits, idle multi-group fan-out, partial-hit CoW, cancellation across
+two batches, and growth/reclamation to the full declared extent.
+
+### What this does not establish
+
+Copying/pickling the pool is too expensive for the production scheduler. This
+path supplies an executable reference for a bounded delta planner; it is not a
+candidate serving implementation. Explicit unallocated extras are caller inputs,
+not an automatically derived bound on every asynchronous scheduler operation.
+The harness does not use the original immutable `Ledger.replace` transition API:
+real-manager observations supply accounting and fingerprints supply stale-plan
+validation, so idle cached identities can return without inventing new epochs.
+
+Next runtime integration must compare a bounded planner against this reference,
+wire the vLLM waiting/running loops and completion sequence, and handle prefix
+publication, speculative rollback, preemption and external KV paths explicitly.
+Unsupported paths should fail closed. Prefix-cache rejection guards and release
+manifests remain unchanged. GPU availability is useful only after that wiring
+passes CPU tests; these commits alone are not ready for a serving trial.
+
+Transaction validation on 2026-10-19: all 50 pinned-image CPU tests passed,
+including 13 transaction tests. Host oracle tests passed with the three
+vLLM-dependent modules skipped as intended. No GPU or production service was
+used or changed.

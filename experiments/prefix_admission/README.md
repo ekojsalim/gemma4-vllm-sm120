@@ -44,3 +44,8 @@ subclass and transfers CoW/deferred-free references to completion fences. The
 same pinned-image runner exercises these paths, including randomized fan-out and
 full-growth drains. See the lifecycle section of the adapter document for its
 remaining scheduler and transaction-boundary limitations.
+
+`transactions.py` adds a CPU scheduler transaction reference: shadow prepare,
+stale-checked commit, hard reservations, allocated lookahead, explicit pending
+extras, ordered completion and cancellation. It is not the production scheduler
+or a performant admission planner. Its tests run in the same pinned-image suite.
