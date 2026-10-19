@@ -19,8 +19,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm_adapter import observe, request_budgets
 
 
-def fixture(capacity=64, bs=4, window=8, inflight=0, extra=0):
-    pool = BlockPool(capacity, True, bs)
+def fixture(capacity=64, bs=4, window=8, inflight=0, extra=0, pool_class=BlockPool):
+    pool = pool_class(capacity, True, bs)
     full = FullAttentionSpec(block_size=bs,num_kv_heads=1,head_size=32,dtype=torch.float16)
     swa = SlidingWindowSpec(block_size=bs,num_kv_heads=1,head_size=32,dtype=torch.float16,
                             sliding_window=window,extra_retained_tokens=extra)

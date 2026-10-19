@@ -38,3 +38,9 @@ isolated pinned-image suite with `experiments/prefix_admission/run-vllm-cpu.sh`.
 It tests real allocator metadata without GPU tensors. Runtime hooks, transient
 reservation planning and scheduler integration remain to be implemented.
 Do not enable prefix caching based solely on these tests.
+
+The lifecycle prototype now obtains allocation epochs directly from a real pool
+subclass and transfers CoW/deferred-free references to completion fences. The
+same pinned-image runner exercises these paths, including randomized fan-out and
+full-growth drains. See the lifecycle section of the adapter document for its
+remaining scheduler and transaction-boundary limitations.
