@@ -6,6 +6,12 @@ pressure/cancellation passed. **Do not promote yet:** translation output and
 speculative acceptance vary across launches/configurations, and this small sample
 does not establish translation quality or an overall latency win.
 
+A subsequent [saved-output quality spot-check](quality-spot-check.md) found no
+obvious cache-related semantic regression. It supports treating the observed
+variation as acceptable in this sample, while leaving representative workload
+validation open. An overall speedup on the old translation fixture is not a
+requirement for this prefix-reuse feature.
+
 ## Configuration and startup correction
 
 RTX 5090, pinned vLLM 0.31 image from release.env, production target and assistant
@@ -59,7 +65,8 @@ reused 800/1,056 and 1,728/2,112 prompt tokens respectively. All 23 checked publ
 outputs in each final variant passed JSON/location, decision or marker/id checks.
 Changing the chapter's location changed the decision from A to B, and restoring
 the original chapter restored A. Marker validity is not a translation-quality
-score; no labeled translation-quality evaluation was performed.
+score; the subsequent qualitative spot-check is linked above. No labeled
+translation-quality evaluation was performed.
 
 Translation is the material caveat:
 
