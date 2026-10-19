@@ -299,6 +299,16 @@ class KVCacheManager:
             )
         )
 
+        # Conservative admission does not support partial-block ownership/CoW.
+        # Heterogeneous Gemma groups are valid, but a hit must align to every
+        # group. Fall back to a cold prefill rather than trimming SWA tables:
+        # trimming could omit blocks needed at the earlier window boundary.
+        if getattr(self, "require_full_group_prefix_hits", False) and any(
+            num_new_computed_tokens % group.kv_cache_spec.block_size
+            for group in self.kv_cache_config.kv_cache_groups
+        ):
+            return self.empty_kv_cache_blocks, 0, 0
+
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
         # (e.g. gateway) can learn about them.
@@ -630,19 +640,31 @@ class KVCacheManager:
         request: Request,
         num_new_tokens: int,
         num_lookahead_tokens: int,
+        *,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
     ) -> tuple[int, int]:
         """Return current ownership and the imminent physical upper bound.
 
         Processed sliding-window blocks are reclaimed before calculating the
-        bound, matching :meth:`allocate_slots`. Prefix caching is excluded by
-        the fixed-length speculative admission configuration.
+        bound, matching :meth:`allocate_slots`. Experimental full-block prefix
+        reuse retains per-request reservations: shared hits count in each
+        request's ownership bound, without a global sharing discount.
         """
-        if self.enable_caching:
-            raise ValueError("speculative admission requires no prefix cache")
         if num_new_tokens <= 0 or num_lookahead_tokens < 0:
             raise ValueError("invalid speculative allocation lengths")
 
-        total_computed_tokens = request.num_computed_tokens
+        hits = (
+            new_computed_blocks.blocks
+            if new_computed_blocks is not None
+            else self.empty_kv_cache_blocks.blocks
+        )
+        managers = self.coordinator.single_type_managers
+        if num_new_computed_tokens < 0 or any(
+            num_new_computed_tokens % m.block_size for m in managers
+        ):
+            raise ValueError("prefix admission supports only full-block hits")
+        total_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
@@ -659,13 +681,24 @@ class KVCacheManager:
         new_blocks = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
-            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
+            new_computed_blocks=hits,
             num_encoder_tokens=0,
             total_computed_tokens=total_computed_tokens,
             num_local_computed_tokens=total_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
-        return current_physical, current_physical + new_blocks
+        # The allocator estimator counts idle hits as free-queue consumption,
+        # but active shared hits also become this request's physical holdings.
+        # Count those too so commit never underestimates request ownership.
+        active_hits = 0
+        for manager, group_hits in zip(managers, hits):
+            skipped = (
+                manager.get_num_skipped_tokens(total_computed_tokens) // manager.block_size
+            )
+            active_hits += sum(
+                not b.is_null and b.ref_cnt > 0 for b in group_hits[skipped:]
+            )
+        return current_physical, current_physical + new_blocks + active_hits
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
