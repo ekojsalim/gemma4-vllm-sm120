@@ -130,3 +130,8 @@ are specification tests, not actual vLLM cache-manager or GPU qualification.
 
 Worktree: feature/prefix-admission-cpu, based on the local integrated 0.31 bundle
 at 69213ca. This development branch does not change a deployed release.
+
+Follow-up CPU stage: [derived bounds and real-manager adapter](prefix-cache-manager-adapter.md)
+now exercise the pinned allocator's active/idle hits, eviction, SWA skipping,
+transient prefill occupancy and deferred/CoW reference lifetimes. This remains
+experimental code outside the runtime overlay.

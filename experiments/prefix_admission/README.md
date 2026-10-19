@@ -32,6 +32,9 @@ completion. The randomized test realizes every admitted child's entire private
 budget in 100 shuffled schedules before draining all requests. It does not prove
 real scheduler liveness, sliding-window geometry bounds or vLLM integration.
 
-Next: derive pinned vLLM group bounds and build adapter tests with the actual
-cache managers; only then wire runtime reservations. Do not enable prefix caching
-based solely on these oracle tests.
+The real-manager adapter and derived bounds are now documented in
+[cache-manager adapter](../../docs/prefix-cache-manager-adapter.md). Run its
+isolated pinned-image suite with `experiments/prefix_admission/run-vllm-cpu.sh`.
+It tests real allocator metadata without GPU tensors. Runtime hooks, transient
+reservation planning and scheduler integration remain to be implemented.
+Do not enable prefix caching based solely on these tests.
