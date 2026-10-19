@@ -47,7 +47,7 @@ cp "${version_dir}/README.md" "${stage}/${name}/README.md"
 if [[ "${VLLM_VERSION}" == 0.31.0 ]]; then
   cp "${root}/README.md" "${stage}/${name}/README.md"
   mkdir -p "${stage}/${name}/docs"
-  cp "${root}"/docs/{deployment.md,provenance.md,validation-0.31.md,ocr-bundle.json,upgrading.md} "${stage}/${name}/docs/"
+  cp "${root}"/docs/{deployment.md,provenance.md,validation-0.31.md,prefix-cache-gpu-candidate.md,ocr-bundle.json,upgrading.md} "${stage}/${name}/docs/"
 fi
 
 archive="${dist}/${name}.tar.gz"

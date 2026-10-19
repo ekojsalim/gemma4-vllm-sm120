@@ -29,13 +29,14 @@ def validate_hybrid_kv_admission(
     prefix_caching: bool,
     cache_groups_supported: bool,
     max_concurrent_batches: int,
+    experimental_prefix_caching: bool = False,
 ) -> None:
     """Fail closed outside supported global hybrid-cache configurations."""
     if has_connector:
         raise ValueError("hybrid KV admission does not support connectors")
     if is_encoder_decoder or has_mamba_layers:
         raise ValueError("hybrid KV admission supports decoder-only attention caches")
-    if prefix_caching:
+    if prefix_caching and not experimental_prefix_caching:
         raise ValueError("hybrid KV admission requires prefix caching disabled")
     if not cache_groups_supported:
         raise ValueError("hybrid KV admission supports only SWA/full-attention groups")

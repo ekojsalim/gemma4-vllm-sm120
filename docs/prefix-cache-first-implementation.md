@@ -1,6 +1,6 @@
 # Chapter-prefix reuse: first implementation
 
-Date: 2026-10-19. Status: design plus CPU reference model; not deployable.
+Date: 2026-10-19. Status: conservative runtime candidate CPU-tested; GPU qualification pending.
 
 ## Scope and workload
 

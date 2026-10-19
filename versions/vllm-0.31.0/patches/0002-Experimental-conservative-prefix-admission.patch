@@ -1,0 +1,174 @@
+diff --git a/vllm/v1/core/kv_admission.py b/vllm/v1/core/kv_admission.py
+index fd165c7..5f3d1c1 100644
+--- a/vllm/v1/core/kv_admission.py
++++ b/vllm/v1/core/kv_admission.py
+@@ -29,13 +29,14 @@ def validate_hybrid_kv_admission(
+     prefix_caching: bool,
+     cache_groups_supported: bool,
+     max_concurrent_batches: int,
++    experimental_prefix_caching: bool = False,
+ ) -> None:
+     """Fail closed outside supported global hybrid-cache configurations."""
+     if has_connector:
+         raise ValueError("hybrid KV admission does not support connectors")
+     if is_encoder_decoder or has_mamba_layers:
+         raise ValueError("hybrid KV admission supports decoder-only attention caches")
+-    if prefix_caching:
++    if prefix_caching and not experimental_prefix_caching:
+         raise ValueError("hybrid KV admission requires prefix caching disabled")
+     if not cache_groups_supported:
+         raise ValueError("hybrid KV admission supports only SWA/full-attention groups")
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 9f5c659..4c039d7 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -630,19 +630,31 @@ class KVCacheManager:
+         request: Request,
+         num_new_tokens: int,
+         num_lookahead_tokens: int,
++        *,
++        num_new_computed_tokens: int = 0,
++        new_computed_blocks: KVCacheBlocks | None = None,
+     ) -> tuple[int, int]:
+         """Return current ownership and the imminent physical upper bound.
+ 
+         Processed sliding-window blocks are reclaimed before calculating the
+-        bound, matching :meth:`allocate_slots`. Prefix caching is excluded by
+-        the fixed-length speculative admission configuration.
++        bound, matching :meth:`allocate_slots`. Experimental full-block prefix
++        reuse retains per-request reservations: shared hits count in each
++        request's ownership bound, without a global sharing discount.
+         """
+-        if self.enable_caching:
+-            raise ValueError("speculative admission requires no prefix cache")
+         if num_new_tokens <= 0 or num_lookahead_tokens < 0:
+             raise ValueError("invalid speculative allocation lengths")
+ 
+-        total_computed_tokens = request.num_computed_tokens
++        hits = (
++            new_computed_blocks.blocks
++            if new_computed_blocks is not None
++            else self.empty_kv_cache_blocks.blocks
++        )
++        managers = self.coordinator.single_type_managers
++        if num_new_computed_tokens < 0 or any(
++            num_new_computed_tokens % m.block_size for m in managers
++        ):
++            raise ValueError("prefix admission supports only full-block hits")
++        total_computed_tokens = request.num_computed_tokens + num_new_computed_tokens
+         self.coordinator.remove_skipped_blocks(
+             request.request_id,
+             max(0, total_computed_tokens - request.num_in_flight_tokens),
+@@ -659,13 +671,24 @@ class KVCacheManager:
+         new_blocks = self.coordinator.get_num_blocks_to_allocate(
+             request_id=request.request_id,
+             num_tokens=num_tokens_need_slot,
+-            new_computed_blocks=self.empty_kv_cache_blocks.blocks,
++            new_computed_blocks=hits,
+             num_encoder_tokens=0,
+             total_computed_tokens=total_computed_tokens,
+             num_local_computed_tokens=total_computed_tokens,
+             num_tokens_main_model=num_tokens_main_model,
+         )
+-        return current_physical, current_physical + new_blocks
++        # The allocator estimator counts idle hits as free-queue consumption,
++        # but active shared hits also become this request's physical holdings.
++        # Count those too so commit never underestimates request ownership.
++        active_hits = 0
++        for manager, group_hits in zip(managers, hits):
++            skipped = (
++                manager.get_num_skipped_tokens(total_computed_tokens) // manager.block_size
++            )
++            active_hits += sum(
++                not b.is_null and b.ref_cnt > 0 for b in group_hits[skipped:]
++            )
++        return current_physical, current_physical + new_blocks + active_hits
+ 
+     def free(self, request: Request) -> None:
+         """Free the blocks allocated for the request.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index b0b5f34..107cd18 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -332,6 +333,34 @@ class Scheduler(SchedulerInterface):
+             raise ValueError(
+                 "hybrid KV speculative admission requires hybrid KV cache admission"
+             )
++        experimental_prefix_admission = (
++            os.environ.get("GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION") == "1"
++        )
++        if use_hybrid_kv_admission and self.cache_config.enable_prefix_caching:
++            if experimental_prefix_admission and (
++                self.prefix_replay_tokens
++                or self.dcp_world_size != 1
++                or vllm_config.parallel_config.tensor_parallel_size != 1
++                or vllm_config.parallel_config.prefill_context_parallel_size != 1
++                or vllm_config.parallel_config.pipeline_parallel_size != 1
++                or any(
++                    type(g.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
++                    or g.kv_cache_spec.block_size != hash_block_size
++                    for g in kv_cache_config.kv_cache_groups
++                )
++                or (
++                    speculative_config is not None
++                    and (
++                        speculative_config.num_speculative_tokens_per_batch_size
++                        or speculative_config.enable_adaptive_verification
++                        or self.num_spec_tokens != 4
++                    )
++                )
++            ):
++                raise ValueError(
++                    "experimental prefix admission requires single-device, "
++                    "uniform full-block hits, no replay and fixed k4 or no speculation"
++                )
+         if use_hybrid_kv_admission:
+             validate_hybrid_kv_admission(
+                 has_connector=self.connector is not None
+@@ -339,6 +368,7 @@ class Scheduler(SchedulerInterface):
+                 is_encoder_decoder=self.is_encoder_decoder,
+                 has_mamba_layers=kv_cache_config.has_mamba_layers,
+                 prefix_caching=self.cache_config.enable_prefix_caching,
++                experimental_prefix_caching=experimental_prefix_admission,
+                 cache_groups_supported=all(
+                     isinstance(
+                         group.kv_cache_spec,
+@@ -720,6 +750,8 @@ class Scheduler(SchedulerInterface):
+         requested_tokens: int,
+         num_lookahead_tokens: int,
+         selected_k: int,
++        num_new_computed_tokens: int = 0,
++        new_computed_blocks: KVCacheBlocks | None = None,
+     ) -> tuple[int, AdmissionReservation | None]:
+         ledger = self.hybrid_kv_admission
+         if ledger is None:
+@@ -728,7 +760,11 @@ class Scheduler(SchedulerInterface):
+ 
+         def allocation_bound(tokens: int) -> tuple[int, int]:
+             return self.kv_cache_manager.prepare_speculative_allocation(
+-                request, tokens, num_lookahead_tokens
++                request,
++                tokens,
++                num_lookahead_tokens,
++                num_new_computed_tokens=num_new_computed_tokens,
++                new_computed_blocks=new_computed_blocks,
+             )
+ 
+         def physical_growth_fits(physical: int, upper: int) -> bool:
+@@ -1590,6 +1626,8 @@ class Scheduler(SchedulerInterface):
+                             num_new_tokens,
+                             effective_lookahead_tokens,
+                             hybrid_selected_k,
++                            num_new_computed_tokens=num_new_local_computed_tokens,
++                            new_computed_blocks=new_computed_blocks,
+                         )
+                     )
+                     if num_new_tokens == 0:

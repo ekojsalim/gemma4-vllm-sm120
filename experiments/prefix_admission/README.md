@@ -55,3 +55,8 @@ The shared transaction suite and 200 seeded differential cases compare it with
 real shadow execution. Pool scans and a flat metadata fingerprint remain; this
 is not yet wired into vLLM's serving scheduler. The adapter document includes
 CPU timing and the remaining runtime work.
+
+The first runtime candidate now uses the original per-request ledger, not this
+shared-credit framework. `test_runtime_scheduler.py` exercises the actual
+Scheduler/AsyncScheduler with that conservative opt-in. See
+[GPU candidate](../../docs/prefix-cache-gpu-candidate.md) for the exact scope.

@@ -1,5 +1,9 @@
 # Gemma 4 / RTX 5090 vLLM runtime overlay
 
+This development branch builds **0.2.1-prefix.1**, an opt-in prefix-cache GPU
+qualification candidate. It has not replaced the validated 0.2.0 production
+baseline described below. See [candidate scope and test procedure](docs/prefix-cache-gpu-candidate.md).
+
 This repository packages the local runtime changes validated for a Gemma 4
 ModelOpt NVFP4 target with a BF16 Gemma 4 MTP assistant on one RTX 5090 (SM120).
 Overlay **0.2.0** targets **vLLM 0.31.0** and uses fixed verification of

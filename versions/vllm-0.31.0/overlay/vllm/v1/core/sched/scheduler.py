@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -332,6 +333,34 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 "hybrid KV speculative admission requires hybrid KV cache admission"
             )
+        experimental_prefix_admission = (
+            os.environ.get("GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION") == "1"
+        )
+        if use_hybrid_kv_admission and self.cache_config.enable_prefix_caching:
+            if experimental_prefix_admission and (
+                self.prefix_replay_tokens
+                or self.dcp_world_size != 1
+                or vllm_config.parallel_config.tensor_parallel_size != 1
+                or vllm_config.parallel_config.prefill_context_parallel_size != 1
+                or vllm_config.parallel_config.pipeline_parallel_size != 1
+                or any(
+                    type(g.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
+                    or g.kv_cache_spec.block_size != hash_block_size
+                    for g in kv_cache_config.kv_cache_groups
+                )
+                or (
+                    speculative_config is not None
+                    and (
+                        speculative_config.num_speculative_tokens_per_batch_size
+                        or speculative_config.enable_adaptive_verification
+                        or self.num_spec_tokens != 4
+                    )
+                )
+            ):
+                raise ValueError(
+                    "experimental prefix admission requires single-device, "
+                    "uniform full-block hits, no replay and fixed k4 or no speculation"
+                )
         if use_hybrid_kv_admission:
             validate_hybrid_kv_admission(
                 has_connector=self.connector is not None
@@ -339,6 +368,7 @@ class Scheduler(SchedulerInterface):
                 is_encoder_decoder=self.is_encoder_decoder,
                 has_mamba_layers=kv_cache_config.has_mamba_layers,
                 prefix_caching=self.cache_config.enable_prefix_caching,
+                experimental_prefix_caching=experimental_prefix_admission,
                 cache_groups_supported=all(
                     isinstance(
                         group.kv_cache_spec,
@@ -720,6 +750,8 @@ class Scheduler(SchedulerInterface):
         requested_tokens: int,
         num_lookahead_tokens: int,
         selected_k: int,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: KVCacheBlocks | None = None,
     ) -> tuple[int, AdmissionReservation | None]:
         ledger = self.hybrid_kv_admission
         if ledger is None:
@@ -728,7 +760,11 @@ class Scheduler(SchedulerInterface):
 
         def allocation_bound(tokens: int) -> tuple[int, int]:
             return self.kv_cache_manager.prepare_speculative_allocation(
-                request, tokens, num_lookahead_tokens
+                request,
+                tokens,
+                num_lookahead_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
             )
 
         def physical_growth_fits(physical: int, upper: int) -> bool:
@@ -1590,6 +1626,8 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             effective_lookahead_tokens,
                             hybrid_selected_k,
+                            num_new_computed_tokens=num_new_local_computed_tokens,
+                            new_computed_blocks=new_computed_blocks,
                         )
                     )
                     if num_new_tokens == 0:
