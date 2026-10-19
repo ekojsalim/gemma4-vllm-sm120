@@ -1,7 +1,10 @@
 VERSION_DIR ?= versions/vllm-0.31.0
 UPSTREAM_CHECKOUT ?=
 
-.PHONY: verify release audit audit-027
+.PHONY: verify release audit audit-027 test-prefix-cpu
+
+test-prefix-cpu:
+	python3 -m unittest discover -s experiments/prefix_admission -v
 
 verify:
 	bash scripts/verify-version.sh "$(VERSION_DIR)"
