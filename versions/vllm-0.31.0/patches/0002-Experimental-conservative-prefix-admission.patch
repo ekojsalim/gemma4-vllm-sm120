@@ -31,7 +31,7 @@ index 9f5c659..4c039d7 100644
 +        new_computed_blocks: KVCacheBlocks | None = None,
      ) -> tuple[int, int]:
          """Return current ownership and the imminent physical upper bound.
- 
+
          Processed sliding-window blocks are reclaimed before calculating the
 -        bound, matching :meth:`allocate_slots`. Prefix caching is excluded by
 -        the fixed-length speculative admission configuration.
@@ -43,7 +43,7 @@ index 9f5c659..4c039d7 100644
 -            raise ValueError("speculative admission requires no prefix cache")
          if num_new_tokens <= 0 or num_lookahead_tokens < 0:
              raise ValueError("invalid speculative allocation lengths")
- 
+
 -        total_computed_tokens = request.num_computed_tokens
 +        hits = (
 +            new_computed_blocks.blocks
@@ -83,7 +83,7 @@ index 9f5c659..4c039d7 100644
 +                not b.is_null and b.ref_cnt > 0 for b in group_hits[skipped:]
 +            )
 +        return current_physical, current_physical + new_blocks + active_hits
- 
+
      def free(self, request: Request) -> None:
          """Free the blocks allocated for the request.
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
@@ -151,7 +151,7 @@ index b0b5f34..107cd18 100644
          ledger = self.hybrid_kv_admission
          if ledger is None:
 @@ -728,7 +760,11 @@ class Scheduler(SchedulerInterface):
- 
+
          def allocation_bound(tokens: int) -> tuple[int, int]:
              return self.kv_cache_manager.prepare_speculative_allocation(
 -                request, tokens, num_lookahead_tokens
@@ -161,7 +161,7 @@ index b0b5f34..107cd18 100644
 +                num_new_computed_tokens=num_new_computed_tokens,
 +                new_computed_blocks=new_computed_blocks,
              )
- 
+
          def physical_growth_fits(physical: int, upper: int) -> bool:
 @@ -1590,6 +1626,8 @@ class Scheduler(SchedulerInterface):
                              num_new_tokens,
