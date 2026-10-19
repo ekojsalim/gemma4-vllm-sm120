@@ -343,9 +343,13 @@ class Scheduler(SchedulerInterface):
                 or vllm_config.parallel_config.tensor_parallel_size != 1
                 or vllm_config.parallel_config.prefill_context_parallel_size != 1
                 or vllm_config.parallel_config.pipeline_parallel_size != 1
+                or min(
+                    g.kv_cache_spec.block_size
+                    for g in kv_cache_config.kv_cache_groups
+                ) != hash_block_size
                 or any(
                     type(g.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
-                    or g.kv_cache_spec.block_size != hash_block_size
+                    or g.kv_cache_spec.block_size % hash_block_size != 0
                     for g in kv_cache_config.kv_cache_groups
                 )
                 or (
@@ -359,7 +363,10 @@ class Scheduler(SchedulerInterface):
             ):
                 raise ValueError(
                     "experimental prefix admission requires single-device, "
-                    "uniform full-block hits, no replay and fixed k4 or no speculation"
+                    "full-block hits, no replay and fixed k4 or no speculation; "
+                    f"hash_block_size={hash_block_size}, "
+                    f"groups={[g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups]}, "
+                    f"replay={self.prefix_replay_tokens}, k={self.num_spec_tokens}"
                 )
         if use_hybrid_kv_admission:
             validate_hybrid_kv_admission(
@@ -434,6 +441,9 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+        )
+        self.kv_cache_manager.require_full_group_prefix_hits = (
+            use_hybrid_kv_admission and experimental_prefix_admission
         )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:

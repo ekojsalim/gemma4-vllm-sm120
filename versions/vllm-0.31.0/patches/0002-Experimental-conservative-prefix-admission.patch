@@ -19,10 +19,27 @@ index fd165c7..5f3d1c1 100644
      if not cache_groups_supported:
          raise ValueError("hybrid KV admission supports only SWA/full-attention groups")
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 9f5c659..4c039d7 100644
+index 9f5c659..ae56591 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -630,19 +630,31 @@ class KVCacheManager:
+@@ -299,6 +299,16 @@ class KVCacheManager:
+             )
+         )
+
++        # Conservative admission does not support partial-block ownership/CoW.
++        # Heterogeneous Gemma groups are valid, but a hit must align to every
++        # group. Fall back to a cold prefill rather than trimming SWA tables:
++        # trimming could omit blocks needed at the earlier window boundary.
++        if getattr(self, "require_full_group_prefix_hits", False) and any(
++            num_new_computed_tokens % group.kv_cache_spec.block_size
++            for group in self.kv_cache_config.kv_cache_groups
++        ):
++            return self.empty_kv_cache_blocks, 0, 0
++
+         # When kv_cache_report_mode is "full", emit BlockStored events
+         # for the reused prefix cache blocks so that external consumers
+         # (e.g. gateway) can learn about them.
+@@ -630,19 +640,31 @@ class KVCacheManager:
          request: Request,
          num_new_tokens: int,
          num_lookahead_tokens: int,
@@ -59,7 +76,7 @@ index 9f5c659..4c039d7 100644
          self.coordinator.remove_skipped_blocks(
              request.request_id,
              max(0, total_computed_tokens - request.num_in_flight_tokens),
-@@ -659,13 +671,24 @@ class KVCacheManager:
+@@ -659,13 +681,24 @@ class KVCacheManager:
          new_blocks = self.coordinator.get_num_blocks_to_allocate(
              request_id=request.request_id,
              num_tokens=num_tokens_need_slot,
@@ -87,7 +104,7 @@ index 9f5c659..4c039d7 100644
      def free(self, request: Request) -> None:
          """Free the blocks allocated for the request.
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index b0b5f34..107cd18 100644
+index b0b5f34..0e598f6 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1,6 +1,7 @@
@@ -98,7 +115,7 @@ index b0b5f34..107cd18 100644
  import time
  from collections import defaultdict, deque
  from collections.abc import Iterable
-@@ -332,6 +333,34 @@ class Scheduler(SchedulerInterface):
+@@ -332,6 +333,41 @@ class Scheduler(SchedulerInterface):
              raise ValueError(
                  "hybrid KV speculative admission requires hybrid KV cache admission"
              )
@@ -112,9 +129,13 @@ index b0b5f34..107cd18 100644
 +                or vllm_config.parallel_config.tensor_parallel_size != 1
 +                or vllm_config.parallel_config.prefill_context_parallel_size != 1
 +                or vllm_config.parallel_config.pipeline_parallel_size != 1
++                or min(
++                    g.kv_cache_spec.block_size
++                    for g in kv_cache_config.kv_cache_groups
++                ) != hash_block_size
 +                or any(
 +                    type(g.kv_cache_spec) not in (FullAttentionSpec, SlidingWindowSpec)
-+                    or g.kv_cache_spec.block_size != hash_block_size
++                    or g.kv_cache_spec.block_size % hash_block_size != 0
 +                    for g in kv_cache_config.kv_cache_groups
 +                )
 +                or (
@@ -128,12 +149,15 @@ index b0b5f34..107cd18 100644
 +            ):
 +                raise ValueError(
 +                    "experimental prefix admission requires single-device, "
-+                    "uniform full-block hits, no replay and fixed k4 or no speculation"
++                    "full-block hits, no replay and fixed k4 or no speculation; "
++                    f"hash_block_size={hash_block_size}, "
++                    f"groups={[g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups]}, "
++                    f"replay={self.prefix_replay_tokens}, k={self.num_spec_tokens}"
 +                )
          if use_hybrid_kv_admission:
              validate_hybrid_kv_admission(
                  has_connector=self.connector is not None
-@@ -339,6 +368,7 @@ class Scheduler(SchedulerInterface):
+@@ -339,6 +375,7 @@ class Scheduler(SchedulerInterface):
                  is_encoder_decoder=self.is_encoder_decoder,
                  has_mamba_layers=kv_cache_config.has_mamba_layers,
                  prefix_caching=self.cache_config.enable_prefix_caching,
@@ -141,7 +165,17 @@ index b0b5f34..107cd18 100644
                  cache_groups_supported=all(
                      isinstance(
                          group.kv_cache_spec,
-@@ -720,6 +750,8 @@ class Scheduler(SchedulerInterface):
+@@ -405,6 +442,9 @@ class Scheduler(SchedulerInterface):
+                 self.cache_config.enable_mamba_shared_prefix_checkpoint
+             ),
+         )
++        self.kv_cache_manager.require_full_group_prefix_hits = (
++            use_hybrid_kv_admission and experimental_prefix_admission
++        )
+         # Bind after construction so connectors can access the cache manager.
+         if self.connector is not None:
+             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
+@@ -720,6 +760,8 @@ class Scheduler(SchedulerInterface):
          requested_tokens: int,
          num_lookahead_tokens: int,
          selected_k: int,
@@ -150,7 +184,7 @@ index b0b5f34..107cd18 100644
      ) -> tuple[int, AdmissionReservation | None]:
          ledger = self.hybrid_kv_admission
          if ledger is None:
-@@ -728,7 +760,11 @@ class Scheduler(SchedulerInterface):
+@@ -728,7 +770,11 @@ class Scheduler(SchedulerInterface):
 
          def allocation_bound(tokens: int) -> tuple[int, int]:
              return self.kv_cache_manager.prepare_speculative_allocation(
@@ -163,7 +197,7 @@ index b0b5f34..107cd18 100644
              )
 
          def physical_growth_fits(physical: int, upper: int) -> bool:
-@@ -1590,6 +1626,8 @@ class Scheduler(SchedulerInterface):
+@@ -1590,6 +1636,8 @@ class Scheduler(SchedulerInterface):
                              num_new_tokens,
                              effective_lookahead_tokens,
                              hybrid_selected_k,

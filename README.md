@@ -1,6 +1,6 @@
 # Gemma 4 / RTX 5090 vLLM runtime overlay
 
-This development branch builds **0.2.1-prefix.1**, an opt-in prefix-cache GPU
+This development branch builds **0.2.1-prefix.2**, an opt-in prefix-cache GPU
 qualification candidate. It has not replaced the validated 0.2.0 production
 baseline described below. See [candidate scope and test procedure](docs/prefix-cache-gpu-candidate.md).
 

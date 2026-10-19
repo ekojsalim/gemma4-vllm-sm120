@@ -1,7 +1,8 @@
 # Prefix-cache GPU qualification candidate
 
-Candidate: **0.2.1-prefix.1**, pinned vLLM 0.31 image from release.env.
-Status: CPU scheduler integration; GPU correctness/performance not yet qualified.
+Candidate: **0.2.1-prefix.2**, pinned vLLM 0.31 image from release.env.
+Status: bounded GPU checks passed; translation quality/performance qualification remains open.
+See [GPU results](results/prefix-cache-gpu-2026-10-19/README.md).
 Production baseline remains 0.2.0, fixed-k4, prefix caching disabled.
 
 ## Deliberately small implementation
@@ -38,11 +39,14 @@ export GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION=1
 
 Use a private port and isolated compilation/cache directories. Check startup's
 actual group geometry before sending requests. The opt-in accepts only exact
-full-attention/SWA specs with a common block size equal to the hash block size,
+full-attention/SWA specs whose block sizes are multiples of the smallest
+group/hash block size (including Gemma SWA16/full32),
 one device, no connector, no bounded-prefix replay, no dynamic/adaptive depth,
 and fixed-k4 (or no speculation for diagnosis). Startup rejects unsupported
 geometry; do not bypass it to make the candidate launch. Partial-hit admission is
-also rejected before allocation. Standard aligned hits and EAGLE's upstream block
+also rejected before allocation. Lookup falls back to cold prefill if a returned
+hit is not aligned to every group; it never truncates SWA tables to an earlier
+window boundary. Standard aligned hits and EAGLE's upstream block
 drop remain enabled. Without the environment opt-in, the old prefix-cache guard
 still rejects caching with hybrid admission.
 
@@ -90,5 +94,6 @@ The candidate archive installed successfully into a fresh digest-pinned image
 with no network or GPU devices. From that installed package, 75 unittest cases
 passed (including 8 actual Scheduler/AsyncScheduler cases), followed by all 47
 existing admission pytest regressions. Bundle manifest verification and
-`git diff --check` passed. GPU tests have not run. This is ready for the bounded
-GPU qualification above, not production promotion.
+`git diff --check` passed. This records the initial CPU-only .1 archive. Candidate .2 additionally passed
+77 prefix-admission tests and the same 47 regressions, followed by the bounded
+GPU session linked above. It is not a production promotion.

@@ -1,6 +1,6 @@
 # Pinned vLLM cache-manager bounds and CPU adapter
 
-Current runtime direction: [0.2.1-prefix.1 GPU candidate](prefix-cache-gpu-candidate.md)
+Current runtime direction: [0.2.1-prefix.2 GPU candidate](prefix-cache-gpu-candidate.md)
 uses the existing per-request ledger with conservative full-block prefix reuse.
 It deliberately defers shared-capacity discounts and does not install the
 reference framework described below. Actual scheduler CPU integration now passes;

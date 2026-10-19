@@ -299,6 +299,16 @@ class KVCacheManager:
             )
         )
 
+        # Conservative admission does not support partial-block ownership/CoW.
+        # Heterogeneous Gemma groups are valid, but a hit must align to every
+        # group. Fall back to a cold prefill rather than trimming SWA tables:
+        # trimming could omit blocks needed at the earlier window boundary.
+        if getattr(self, "require_full_group_prefix_hits", False) and any(
+            num_new_computed_tokens % group.kv_cache_spec.block_size
+            for group in self.kv_cache_config.kv_cache_groups
+        ):
+            return self.empty_kv_cache_blocks, 0, 0
+
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
         # (e.g. gateway) can learn about them.

@@ -25,7 +25,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 
-def make_scheduler(blocks=64, opt_in=True, speculative=False, async_mode=False, hash_size=16):
+def make_scheduler(blocks=64, opt_in=True, speculative=False, async_mode=False, hash_size=16, full_block_size=16):
     with tempfile.TemporaryDirectory() as d:
         Path(d,'config.json').write_text(json.dumps(dict(
             architectures=['OPTForCausalLM'],model_type='opt',hidden_size=64,
@@ -42,7 +42,7 @@ def make_scheduler(blocks=64, opt_in=True, speculative=False, async_mode=False, 
                           device_config=DeviceConfig(device='cpu'))
         common=dict(block_size=16,num_kv_heads=1,head_size=16,dtype=torch.float16)
         kv=KVCacheConfig(num_blocks=blocks,kv_cache_tensors=[],kv_cache_groups=[
-            KVCacheGroupSpec(['full'],FullAttentionSpec(**common)),
+            KVCacheGroupSpec(['full'],FullAttentionSpec(**(common | dict(block_size=full_block_size)))),
             KVCacheGroupSpec(['swa'],SlidingWindowSpec(**common,sliding_window=32))])
         if speculative:
             # Metadata-only Gemma MTP contract; no target or draft model runs.
@@ -57,7 +57,7 @@ def make_scheduler(blocks=64, opt_in=True, speculative=False, async_mode=False, 
         register_all_kvcache_specs(config)
         with patch.dict(os.environ,{'GEMMA4_EXPERIMENTAL_PREFIX_ADMISSION':'1' if opt_in else '0'}):
             return (AsyncScheduler if async_mode else Scheduler)(
-                config,kv,StructuredOutputManager(config),block_size=16,hash_block_size=hash_size)
+                config,kv,StructuredOutputManager(config),block_size=full_block_size,hash_block_size=hash_size)
 
 
 def request(rid, max_tokens=4, suffix=99):
@@ -167,8 +167,35 @@ class RuntimeSchedulerTests(unittest.TestCase):
         self.assertEqual(s.kv_cache_manager.block_pool.get_num_free_blocks(),63)
 
     def test_fine_grained_hashing_rejected(self):
-        with self.assertRaisesRegex(ValueError,'uniform full-block'):
+        with self.assertRaisesRegex(ValueError,'full-block'):
             make_scheduler(hash_size=8)
+
+    def test_heterogeneous_gemma_groups_warm_and_drain(self):
+        s=make_scheduler(speculative=True, full_block_size=32)
+        for rid in ('parent', 'child'):
+            r=request(rid,max_tokens=1)
+            r=Request(rid,list(range(1,97))+[99],r.sampling_params,
+                      pooling_params=None,block_hasher=get_request_block_hasher(16,sha256))
+            s.add_request(r)
+            batch=s.schedule()
+            if rid == 'child':
+                self.assertLess(batch.num_scheduled_tokens[rid],97)
+                self.assertEqual((97-batch.num_scheduled_tokens[rid]) % 32,0)
+            finish_step(s,batch)
+        self.assertEqual(s.hybrid_kv_admission.charged_blocks,0)
+        self.assertEqual(s.kv_cache_manager.block_pool.get_num_free_blocks(),63)
+
+    def test_partial_group_lookup_falls_back_to_cold(self):
+        s=make_scheduler(full_block_size=32)
+        manager=s.kv_cache_manager
+        before=manager.block_pool.get_num_free_blocks()
+        with patch.object(manager.coordinator,'find_longest_cache_hit',
+                          return_value=([[],[]],16,0)):
+            blocks,hit,boundary=manager.get_computed_blocks(request('partial'))
+        self.assertEqual(hit,0)
+        self.assertEqual(boundary,0)
+        self.assertEqual(blocks,manager.empty_kv_cache_blocks)
+        self.assertEqual(manager.block_pool.get_num_free_blocks(),before)
 
     def test_partial_hit_rejected_before_allocation(self):
         s=make_scheduler()
